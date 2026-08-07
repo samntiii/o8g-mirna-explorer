@@ -1,0 +1,48 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+._*
+*.tar.gz
+*.log
+pids/
+.idea/
+.vscode/
+*.swp
+*~
+
+# large generated / downloaded runtime data (rebuild via scripts)
+o8g_targets.db
+o8g_targets.db-*
+o8g_reverse.db
+o8g_reverse.db-*
+o8g_states.parquet
+utr3_human.parquet
+hsa_mature.parquet
+gene_aliases.parquet
+gene_aliases.meta.txt
+gene_id_map.parquet
+mature.fa
+data_raw/
+
+# paper analysis (benchmarks, figures, gold, manuscript) — keep local only
+paper/
+
+# local examples / backups not part of the shared app
+examples/
+views_multipage_bak/
+*.bak.py
+app.multipage.bak.py
+enrichment_display_comparison.png
+oxomir directions.rtf
+
+# secrets / deploy credentials
+.streamlit/secrets.toml
+cloudflared-credentials.json
+*.pem
+.env
+.env.*
+
+# OS / editor
+.cursor/

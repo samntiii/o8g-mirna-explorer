@@ -1,0 +1,18 @@
+# Copy to ~/.cloudflared/config.yml after:
+#   cloudflared tunnel login
+#   cloudflared tunnel create o8g-explorer
+#   cloudflared tunnel route dns o8g-explorer oxomir.samnti.com
+#
+# Replace TUNNEL_UUID with the id printed by `cloudflared tunnel list`
+# and credentials-file with the json path under ~/.cloudflared/.
+# Apex samnti.com is already used by the foundry tunnel.
+
+tunnel: TUNNEL_UUID
+credentials-file: /Users/santiago/.cloudflared/TUNNEL_UUID.json
+
+ingress:
+  - hostname: oxomir.samnti.com
+    service: http://127.0.0.1:8501
+  - hostname: o8g.samnti.com
+    service: http://127.0.0.1:8501
+  - service: http_status:404

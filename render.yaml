@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: o8g-mirna-explorer
+    runtime: docker
+    plan: starter        # ~$7/mo, always-on; use "free" to try (sleeps when idle)
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: PORT
+        value: 8501

@@ -1,0 +1,11 @@
+# Named tunnel for the o8G-miRNA Explorer.
+# Root samnti.com already has a DNS record (foundry tunnel) — do not overwrite.
+tunnel: afc7b6e7-b7bc-45f1-95b4-4e7bfab3ee21
+credentials-file: /Users/santiago/.cloudflared/afc7b6e7-b7bc-45f1-95b4-4e7bfab3ee21.json
+
+ingress:
+  - hostname: oxomir.samnti.com
+    service: http://127.0.0.1:8501
+  - hostname: o8g.samnti.com
+    service: http://127.0.0.1:8501
+  - service: http_status:404

@@ -1,0 +1,204 @@
+"""
+o8g_precision.py
+================
+Precision ladder for oxomiR target lists.
+
+CORE CONSTRAINT
+---------------
+Every filter is applied independently to the unmodified and oxidized target
+tables; gained / lost / shared are set differences *after* filtering.
+Never filter the delta itself.
+
+Modes (PrecisionMode)
+---------------------
+Sensitive  — rank >= 3 (7mer-m8 + 8mer). Discovery default in the UI.
+Stringent  — rank == 4 (8mer only). Default for paper / Fig.4 exports.
+Consensus  — rank >= 3 AND TargetScan-conserved on the *unmodified* baseline;
+             oxidized state uses the same rank gate (conservation is undefined
+             for novel o8G motifs in TargetScan — see note below). Deltas =
+             setdiff after filters. Use for main-text quantitative claims.
+
+Deprecated alias
+----------------
+"HighConf" previously meant SITE_WEIGHT score ≥ 1.0, but without stored
+multiplicity blobs that gate collapsed to 8mer-only (= Stringent) and recovered
+the fewest gold effects. It is merged into Stringent; ``from_mode("HighConf")``
+still resolves for backward compatibility.
+
+Conservation note
+-----------------
+TargetScan conserved tables annotate *canonical* (unoxidized) seed matches.
+Applying is_conserved==True identically to oxidized motifs would zero oxomiR
+gains (those complementary words are absent from TargetScan). Consensus
+therefore applies conservation to the unmodified baseline set and the same
+*rank* filter to both states.
+
+Feature flags (env or constructors)
+-----------------------------------
+O8G_USE_CONSERVATION=1|0
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from enum import Enum
+
+import pandas as pd
+
+
+class PrecisionMode(str, Enum):
+    SENSITIVE = "Sensitive"
+    STRINGENT = "Stringent"
+    CONSENSUS = "Consensus"
+
+
+# Old UI / CSV label → current mode (HighConf was a Stringent duplicate).
+_MODE_ALIASES = {
+    "HighConf": PrecisionMode.STRINGENT,
+    "highconf": PrecisionMode.STRINGENT,
+}
+
+
+@dataclass(frozen=True)
+class PrecisionConfig:
+    mode: PrecisionMode = PrecisionMode.SENSITIVE
+    use_conservation: bool = True
+
+    @staticmethod
+    def from_mode(mode: PrecisionMode | str, **kwargs) -> "PrecisionConfig":
+        if isinstance(mode, str):
+            mode = _MODE_ALIASES.get(mode, mode)
+            if not isinstance(mode, PrecisionMode):
+                mode = PrecisionMode(mode)
+        return PrecisionConfig(mode=mode, **kwargs)
+
+    @staticmethod
+    def ui_default() -> "PrecisionConfig":
+        return PrecisionConfig(mode=PrecisionMode.SENSITIVE)
+
+    @staticmethod
+    def paper_default() -> "PrecisionConfig":
+        return PrecisionConfig(mode=PrecisionMode.STRINGENT)
+
+    @staticmethod
+    def claim_default() -> "PrecisionConfig":
+        return PrecisionConfig(mode=PrecisionMode.CONSENSUS)
+
+
+def env_flag(name: str, default: bool = True) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v not in ("0", "false", "False", "no")
+
+
+def apply_precision_filter(
+    df: pd.DataFrame,
+    cfg: PrecisionConfig,
+    *,
+    conserved_symbols: set[str] | None = None,
+    is_unmodified_state: bool = True,
+) -> pd.DataFrame:
+    """Filter one state's target table. Does not touch deltas.
+
+    Expected columns (subset OK): symbol, site_rank, is_conserved.
+    """
+    if df is None or df.empty:
+        return df.iloc[0:0].copy() if df is not None else pd.DataFrame()
+
+    out = df
+    use_cons = cfg.use_conservation and env_flag("O8G_USE_CONSERVATION", True)
+
+    mode = cfg.mode
+    if mode == PrecisionMode.SENSITIVE:
+        out = out[out["site_rank"] >= 3]
+    elif mode == PrecisionMode.STRINGENT:
+        out = out[out["site_rank"] >= 4]
+    elif mode == PrecisionMode.CONSENSUS:
+        out = out[out["site_rank"] >= 3]
+        if use_cons and is_unmodified_state:
+            if "is_conserved" in out.columns:
+                out = out[out["is_conserved"].astype(bool)]
+            elif conserved_symbols is not None:
+                out = out[out["symbol"].isin(conserved_symbols)]
+        # oxidized: rank gate only (TargetScan has no o8G motifs)
+    else:
+        raise ValueError(mode)
+
+    return out.reset_index(drop=True)
+
+
+def partition_after_filter(
+    unmod: pd.DataFrame,
+    oxid: pd.DataFrame,
+    cfg: PrecisionConfig,
+    *,
+    conserved_symbols: set[str] | None = None,
+) -> dict[str, set[str]]:
+    """Apply filters to each state; deltas = setdiff after filtering.
+
+    Consensus special-case (documented): conservation shrinks the *unmodified
+    baseline* for claims, but **gained** uses the same rank gate on both states
+    without conservation on the oxidized side *and* subtracts the full
+    rank-filtered unmodified set — so gains remain true o8G retargeting events,
+    not artifacts of dropping non-conserved unmodified targets.
+    """
+    if cfg.mode != PrecisionMode.CONSENSUS:
+        u = apply_precision_filter(
+            unmod, cfg, conserved_symbols=conserved_symbols, is_unmodified_state=True
+        )
+        o = apply_precision_filter(
+            oxid, cfg, conserved_symbols=conserved_symbols, is_unmodified_state=False
+        )
+        su = set(u["symbol"]) if len(u) else set()
+        so = set(o["symbol"]) if len(o) else set()
+        return {
+            "unmod": su,
+            "oxid": so,
+            "shared": su & so,
+            "lost": su - so,
+            "gained": so - su,
+        }
+
+    # Consensus
+    u_rank = apply_precision_filter(
+        unmod,
+        PrecisionConfig(mode=PrecisionMode.SENSITIVE),
+        is_unmodified_state=True,
+    )
+    o_rank = apply_precision_filter(
+        oxid,
+        PrecisionConfig(mode=PrecisionMode.SENSITIVE),
+        is_unmodified_state=False,
+    )
+    su_rank = set(u_rank["symbol"]) if len(u_rank) else set()
+    so_rank = set(o_rank["symbol"]) if len(o_rank) else set()
+    u_cons = apply_precision_filter(
+        unmod, cfg, conserved_symbols=conserved_symbols, is_unmodified_state=True
+    )
+    su_cons = set(u_cons["symbol"]) if len(u_cons) else set()
+    return {
+        "unmod": su_cons,  # conserved baseline for claims
+        "oxid": so_rank,
+        "shared": su_cons & so_rank,
+        "lost": su_cons - so_rank,  # conserved targets lost on oxidation
+        "gained": so_rank - su_rank,  # true chemical gains (rank gate only)
+    }
+
+
+def assert_retargeting_signal(
+    parts: dict[str, set[str]],
+    *,
+    min_gained: int = 50,
+    min_lost: int = 50,
+    min_shared: int = 50,
+    label: str = "miR-1 o8G@7",
+) -> None:
+    """Regression: oxidation still yields substantial partitions after filtering."""
+    g, l, s = len(parts["gained"]), len(parts["lost"]), len(parts["shared"])
+    if g < min_gained or l < min_lost or s < min_shared:
+        raise AssertionError(
+            f"{label} retargeting collapsed under filter: "
+            f"gained={g}, lost={l}, shared={s} "
+            f"(need ≥{min_gained}/{min_lost}/{min_shared})"
+        )
