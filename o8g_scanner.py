@@ -310,6 +310,7 @@ class TargetScanner:
         counts["supp3_score"] = p3_vals
         counts["min_end_dist"] = end_vals
         counts["site_position"] = pos_vals
+        counts["site_start"] = [int(best_pos.get(int(gi), 0)) for gi in counts["gene_idx"].tolist()]
         counts["gene_id"] = self.genes[counts["gene_idx"].to_numpy()]
         counts["site_rank"] = counts["best_rank"]
         counts["site_type"] = [RANK_SITE[int(r)] for r in counts["best_rank"]]

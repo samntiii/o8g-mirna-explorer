@@ -11,6 +11,10 @@ Engine modules: o8g_engine.py, o8g_scanner.py, o8g_enrich.py, o8g_plots.py, o8g_
 """
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Prefer ViennaRNA CLIs from the mirna_viewer conda env when present
+_VRNA_BIN = "/opt/homebrew/anaconda3/envs/mirna_viewer/bin"
+if os.path.isdir(_VRNA_BIN):
+    os.environ["PATH"] = _VRNA_BIN + os.pathsep + os.environ.get("PATH", "")
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -20,9 +24,14 @@ from o8g_db import TargetDB
 from o8g_enrich import enrich, compare_states, available_libraries
 from o8g_genes import ID_TYPES, GeneResolver
 from o8g_precision import PrecisionMode, PrecisionConfig
+from o8g_binding import add_binding_efficiency, FORMULA_CAPTION
+from o8g_thermo import METRIC_CAPTION, vienna_available
+from o8g_pubthermo import annotate_gene_mirna_hits, PROVENANCE_CAPTION as PUBTHERMO_CAPTION
+import o8g_refsets as refsets
 import o8g_plots as plots
 import importlib as _importlib
 plots = _importlib.reload(plots)   # pick up edits to the plotting module on rerun
+refsets = _importlib.reload(refsets)
 
 st.set_page_config(page_title="o8G-miRNA Retargeting Explorer", layout="wide",
                    initial_sidebar_state="expanded")
@@ -33,7 +42,7 @@ RANK_LABEL = {1: "6mer", 2: "7mer-A1", 3: "7mer-m8", 4: "8mer"}
 
 # Bump when TargetDB / GeneResolver constructor API changes so Streamlit
 # drops stale @cache_resource instances across hot-reloads.
-_CACHE_VER = 6
+_CACHE_VER = 13
 
 
 @st.cache_resource
@@ -65,6 +74,34 @@ resolver = get_resolver()
 
 
 # ---------- helpers ----------
+def _ox_positions_from_label(label: str) -> tuple[int, ...]:
+    if not label or label == "none":
+        return ()
+    part = label.replace("o8G@", "")
+    return tuple(int(x) for x in part.split(",") if x.strip().isdigit())
+
+
+def enrich_binding(
+    df: pd.DataFrame,
+    *,
+    label: str,
+    sort: bool = True,
+    with_thermo: bool = False,
+    scanner=None,
+) -> pd.DataFrame:
+    """BE (+ optional RNAduplex / RNAup / TargetScan context++ columns)."""
+    return add_binding_efficiency(
+        df,
+        sort=sort,
+        scanner=scanner,
+        mature_dna=info["seq_dna"],
+        oxidized_positions=_ox_positions_from_label(label),
+        mirna=mirna,
+        is_unmodified=(label == "none"),
+        with_thermo=with_thermo,
+    )
+
+
 def seed_html(seed: str, oxidized: set) -> str:
     """Render seed with G colored; oxidized Gs boxed red (o8G), normal G blue."""
     out = []
@@ -89,11 +126,24 @@ def seed_html(seed: str, oxidized: set) -> str:
 st.sidebar.title("🧬 o8G-miRNA Explorer")
 st.sidebar.caption("Predicting miRNA target retargeting by 8-oxoguanine seed oxidation")
 
+# Apply a jump requested from the Gene → miRNA/oxomiR tab (previous run).
+_jump = st.session_state.pop("_jump_mirna", None)
+if _jump:
+    st.session_state["mirna_search"] = ""  # clear filter so the target is in the dropdown
+    st.session_state["_pending_mirna_select"] = _jump
+    _ox = st.session_state.pop("_jump_ox_positions", None)
+    if _ox is not None:
+        st.session_state["single_state_ox_positions"] = list(_ox)
+
 mir_df = db.mirnas()
-query = st.sidebar.text_input("Search miRNA (optional filter)", value="",
-                              placeholder="e.g. miR-1, miR-124, let-7 — leave blank for all",
-                              help="Type part of a miRNA name to narrow the list. "
-                                   "Leave blank to browse all miRNAs in the dropdown below.")
+query = st.sidebar.text_input(
+    "Search miRNA (optional filter)",
+    value="",
+    placeholder="e.g. miR-1, miR-124, let-7 — leave blank for all",
+    help="Type part of a miRNA name to narrow the list. "
+         "Leave blank to browse all miRNAs in the dropdown below.",
+    key="mirna_search",
+)
 matches = mir_df[mir_df["mirna"].str.contains(query, case=False, na=False)] if query else mir_df
 if len(matches) == 0:
     st.sidebar.warning("No miRNA matches that search.")
@@ -105,9 +155,24 @@ for _pref in ("hsa-miR-1-3p", "hsa-miR-1-2-3p", "hsa-miR-1"):
     if _pref in opts:
         default_idx = opts.index(_pref)
         break
+
+_pending = st.session_state.pop("_pending_mirna_select", None)
+if _pending is not None:
+    if _pending in opts:
+        st.session_state["mirna_select"] = _pending
+        st.sidebar.success(f"Loaded **{_pending}** from Gene → miRNA/oxomiR")
+    else:
+        st.sidebar.warning(f"`{_pending}` is not in the current miRNA list.")
+
+# Keep selectbox value valid when the search filter shrinks the options
+if st.session_state.get("mirna_select") not in opts:
+    st.session_state["mirna_select"] = opts[default_idx]
+
 mirna = st.sidebar.selectbox(
     f"Select miRNA ({len(matches)} of {len(mir_df)} shown)",
-    opts, index=default_idx)
+    opts,
+    key="mirna_select",
+)
 info = db.mirna_info(mirna)
 seed = info["seed"]
 gpos = g_positions(seed)
@@ -139,6 +204,9 @@ st.sidebar.caption(
     "Paper / claims: use **Stringent** or **Consensus**. "
     "Gained/lost are always computed after filtering both states."
 )
+# Do NOT build TargetScanner (~40s) on every page load — only when thermo / live
+# UTR scans are explicitly requested. Streamlit re-runs the whole script on each
+# widget change, so eager loading freezes every tab.
 scanner = None
 # Legacy slider kept as an additional floor within the mode (rarely needed)
 min_rank = st.sidebar.select_slider(
@@ -162,16 +230,41 @@ st.caption("Guanines are oxidation-eligible. Blue = normal G (pairs C); red = o8
 states = enumerate_states(seed)
 state_labels = [s.label for s in states]
 
-tab_browse, tab_compare, tab_all, tab_gene = st.tabs(
-    ["Single state — targets", "Compare two states", "All states",
-     "Gene → miRNA/oxomiR"])
+# Conditional sections (not st.tabs): Streamlit executes *all* tab bodies on every
+# rerun, so expensive Targets / External-DB work was freezing Gene → miRNA.
+_SECTION = st.radio(
+    "View",
+    [
+        "Single state — targets",
+        "Compare two states",
+        "All states",
+        "Gene → miRNA/oxomiR",
+        "External DB comparison",
+    ],
+    horizontal=True,
+    key="main_section",
+)
 
 # ===== TAB 1: single state target list =====
-with tab_browse:
+if _SECTION == "Single state — targets":
     c1, c2 = st.columns([3, 2])
     with c1:
-        ox_choice = st.multiselect("Oxidize which guanine position(s)?", gpos, default=[],
-            help="Select seed G positions to model as 8-oxoG (o8G). None = fully normal seed.")
+        # Gene-tab jump may prefill ox positions; drop any that are not Gs on this seed.
+        if "single_state_ox_positions" in st.session_state:
+            st.session_state["single_state_ox_multiselect"] = [
+                int(p)
+                for p in st.session_state.pop("single_state_ox_positions")
+                if int(p) in gpos
+            ]
+        _cur_ox = st.session_state.get("single_state_ox_multiselect", [])
+        if any(p not in gpos for p in _cur_ox):
+            st.session_state["single_state_ox_multiselect"] = [p for p in _cur_ox if p in gpos]
+        ox_choice = st.multiselect(
+            "Oxidize which guanine position(s)?",
+            gpos,
+            key="single_state_ox_multiselect",
+            help="Select seed G positions to model as 8-oxoG (o8G). None = fully normal seed.",
+        )
         cur = SeedState(seed, tuple(sorted(ox_choice)))
         st.markdown(seed_html(seed, set(ox_choice)), unsafe_allow_html=True)
         st.markdown(f"**State:** `{cur.label}`  •  target motifs (5'→3' on mRNA):")
@@ -190,19 +283,45 @@ with tab_browse:
         seed,
         cur.label,
         precision_cfg,
-        scanner=scanner,
+        scanner=None,
         mature_dna=info["seq_dna"],
         mirna=mirna,
     )
     if "site_rank" in tdf.columns:
         tdf = tdf[tdf["site_rank"] >= min_rank]
+    score_targets_thermo = st.checkbox(
+        "Add ViennaRNA / TargetScan energetics (slow)",
+        value=False,
+        help="Runs RNAduplex / RNAup-style opening + TargetScan context++ for this target list. "
+             "Off by default — Streamlit re-runs the script on every click.",
+        key="targets_tab_thermo",
+    )
+    if score_targets_thermo:
+        with st.spinner("Loading UTR index + scoring RNAduplex / RNAup / TargetScan…"):
+            scanner = get_scanner()
+            tdf = enrich_binding(
+                tdf, label=cur.label, sort=True, with_thermo=True, scanner=scanner
+            )
+    else:
+        tdf = enrich_binding(
+            tdf, label=cur.label, sort=True, with_thermo=False, scanner=None
+        )
     st.markdown(
         f"**{len(tdf)} predicted target genes** · mode `{precision_cfg.mode.value}` "
         f"(extra floor ≥ {RANK_LABEL[min_rank]})"
     )
+    st.caption(FORMULA_CAPTION)
+    if score_targets_thermo:
+        st.caption(METRIC_CAPTION)
+        if scanner is None:
+            st.caption("UTR parquet missing — ViennaRNA duplex/RNAup columns unavailable.")
+        elif not vienna_available():
+            st.caption("ViennaRNA Python package not installed — duplex/RNAup columns unavailable.")
     show_cols = [c for c in [
-        "symbol", "gene_id", "site_type", "site_rank", "n_8mer", "n_7mer_m8",
-        "score", "context_score", "is_conserved",
+        "symbol", "gene_id", "binding_efficiency",
+        "dG_RNAduplex", "dG_RNAup", "contextpp_TargetScan", "context_analog",
+        "site_type", "site_rank",
+        "n_8mer", "n_7mer_m8", "score", "context_score", "is_conserved",
     ] if c in tdf.columns]
     st.dataframe(tdf[show_cols] if show_cols else tdf, width='stretch', height=320)
     st.download_button("⬇ Download target list (CSV)", tdf.to_csv(index=False),
@@ -216,7 +335,7 @@ with tab_browse:
                      width='stretch', height=280)
 
 # ===== TAB 2: compare two states → volcano =====
-with tab_compare:
+elif _SECTION == "Compare two states":
     if len(gpos) == 0:
         st.info("No oxidation states to compare for a G-free seed.")
     else:
@@ -229,10 +348,10 @@ with tab_compare:
         cc2.markdown(seed_html(seed, set(stB.oxidized_positions)), unsafe_allow_html=True)
 
         tA = db.targets_filtered(
-            seed, sA, precision_cfg, scanner=scanner, mature_dna=info["seq_dna"], mirna=mirna
+            seed, sA, precision_cfg, scanner=None, mature_dna=info["seq_dna"], mirna=mirna
         )
         tB = db.targets_filtered(
-            seed, sB, precision_cfg, scanner=scanner, mature_dna=info["seq_dna"], mirna=mirna
+            seed, sB, precision_cfg, scanner=None, mature_dna=info["seq_dna"], mirna=mirna
         )
         if "site_rank" in tA.columns:
             tA = tA[tA["site_rank"] >= max(min_rank, 3 if precision_cfg.mode != PrecisionMode.STRINGENT else 4)]
@@ -267,6 +386,32 @@ with tab_compare:
         lost   = merged[merged["category"] == "Lost"][["symbol", "gene_id", f"site_{sA}"]]
         gained = merged[merged["category"] == "Gained"][["symbol", "gene_id", f"site_{sB}"]]
         shared = merged[merged["category"] == "Shared"][["symbol", "gene_id", f"site_{sA}", f"site_{sB}"]]
+        # attach binding efficiency from the state where the gene is present
+        # (dedupe symbols — set_index must be unique for Series.map)
+        tA_ann = enrich_binding(tA, label=sA, sort=False).drop_duplicates("symbol")
+        tB_ann = enrich_binding(tB, label=sB, sort=False).drop_duplicates("symbol")
+        tA_be = tA_ann.set_index("symbol")["binding_efficiency"]
+        tB_be = tB_ann.set_index("symbol")["binding_efficiency"]
+        lost = lost.assign(binding_efficiency=lost["symbol"].map(tA_be))
+        gained = gained.assign(binding_efficiency=gained["symbol"].map(tB_be))
+        shared = shared.assign(
+            binding_efficiency=shared["symbol"].map(tB_be).fillna(shared["symbol"].map(tA_be))
+        )
+        # Carry the three external-style metrics onto differential tables
+        for col in ("dG_RNAduplex", "dG_RNAup", "contextpp_TargetScan"):
+            if col in tA_ann.columns:
+                lost[col] = lost["symbol"].map(tA_ann.set_index("symbol")[col])
+            if col in tB_ann.columns:
+                gained[col] = gained["symbol"].map(tB_ann.set_index("symbol")[col])
+                shared[col] = shared["symbol"].map(tB_ann.set_index("symbol")[col]).fillna(
+                    shared["symbol"].map(tA_ann.set_index("symbol")[col])
+                    if col in tA_ann.columns
+                    else np.nan
+                )
+        lost = lost.sort_values("binding_efficiency", ascending=False)
+        gained = gained.sort_values("binding_efficiency", ascending=False)
+        shared = shared.sort_values("binding_efficiency", ascending=False)
+        st.caption(METRIC_CAPTION)
 
         gc1, gc2, gc3 = st.columns(3)
         with gc1:
@@ -312,7 +457,7 @@ with tab_compare:
             st.warning("Need ≥5 strong-site targets in each state for enrichment.")
 
 # ===== TAB 3: all states heatmap =====
-with tab_all:
+elif _SECTION == "All states":
     if len(gpos) == 0:
         st.info("Only one state exists for a G-free seed.")
     else:
@@ -348,7 +493,7 @@ with tab_all:
                 st.warning("Not enough enriched pathways to build a dot plot at this setting.")
 
 # ===== TAB 4: reverse gene → miRNA/oxomiR =====
-with tab_gene:
+elif _SECTION == "Gene → miRNA/oxomiR":
     st.markdown("#### Find miRNA / oxomiR states that target a gene")
     st.caption(
         "Offline reverse lookup against strong sites (7mer-m8 + 8mer) in the precomputed "
@@ -438,6 +583,25 @@ with tab_gene:
                     m2.metric("Unique seeds", int(n_seeds))
                     m3.metric("Oxidized-state rows", n_ox)
 
+                    score_thermo = st.checkbox(
+                        "Add published energetics (RNAduplex / RNAup / TargetScan context++)",
+                        value=False,
+                        help="Same methods as the interaction viewer: Bartel site type is already "
+                             "in site_type; ΔG from ViennaRNA; context++ from TargetScan 8 tables. "
+                             "Off by default — scoring runs RNAduplex/RNAup on the first N rows.",
+                        key="gene_tab_pubthermo_v2",
+                    )
+                    max_thermo = st.slider(
+                        "Max rows to score with RNAduplex/RNAup",
+                        min_value=20,
+                        max_value=min(500, max(20, len(view))),
+                        value=min(50, max(20, len(view))),
+                        help="Full gene hits can be thousands of rows; energetics are computed "
+                             "for the first N rows of the filtered table (results are cached).",
+                        key="gene_tab_thermo_n_v2",
+                        disabled=not score_thermo,
+                    )
+
                     show = view[
                         [
                             "mirna",
@@ -457,6 +621,56 @@ with tab_gene:
                             "vs_unmodified": "vs_unmodified_seed",
                         }
                     )
+
+                    if score_thermo:
+                        with st.spinner(
+                            f"Scoring up to {max_thermo} rows (RNAduplex/RNAup) + "
+                            "one-pass TargetScan context++…"
+                        ):
+                            scored = annotate_gene_mirna_hits(
+                                view,
+                                gene_symbol=hit.symbol,
+                                gene_idx=hit.gene_idx,
+                                scanner=None,
+                                db=db,
+                                max_thermo_rows=max_thermo,
+                            )
+                        for col in (
+                            "dG_hybrid",
+                            "dG_open",
+                            "ddG",
+                            "contextpp_TargetScan",
+                        ):
+                            if col in scored.columns:
+                                show[col] = scored[col].values
+                        # Prefer a readable column order
+                        lead = [
+                            "mirna",
+                            "oxidation_state",
+                            "site_type",
+                            "dG_hybrid",
+                            "dG_open",
+                            "ddG",
+                            "contextpp_TargetScan",
+                            "seed",
+                            "oxidized_positions",
+                            "site_rank",
+                            "motif_7mer_m8",
+                            "motif_8mer",
+                            "vs_unmodified_seed",
+                            "all_mirnas",
+                        ]
+                        show = show[[c for c in lead if c in show.columns]]
+                        st.caption(PUBTHERMO_CAPTION)
+                        _utr_pq = os.path.join(
+                            os.path.dirname(os.path.abspath(__file__)), "utr3_human.parquet"
+                        )
+                        if not os.path.exists(_utr_pq):
+                            st.caption(
+                                "UTR parquet unavailable — motif windows missing; "
+                                "ΔG columns may be empty."
+                            )
+
                     st.dataframe(show, width="stretch", height=420, hide_index=True)
                     st.caption(
                         "**vs_unmodified_seed:** *unmodified* = targeted by the normal seed; "
@@ -464,6 +678,63 @@ with tab_gene:
                         "*gained on oxidation* = only appears under an o8G state for that seed "
                         "(retargeting)."
                     )
+
+                    st.markdown("##### Open a hit in Explorer")
+                    st.caption(
+                        "Loads the miRNA into the sidebar (and optionally its oxidation state "
+                        "into **Single state — targets**). Then switch tabs to browse / compare / "
+                        "enrich as usual."
+                    )
+                    jump_opts = [
+                        f"{r.mirna}  ·  {r.oxidation_state}"
+                        for r in show.itertuples(index=False)
+                    ]
+                    # Prefer unique labels while preserving order
+                    seen = set()
+                    jump_opts_u = []
+                    for lab in jump_opts:
+                        if lab not in seen:
+                            seen.add(lab)
+                            jump_opts_u.append(lab)
+                    if jump_opts_u:
+                        jump_lab = st.selectbox(
+                            "miRNA · oxidation state",
+                            jump_opts_u,
+                            key="gene_tab_jump_pick",
+                        )
+                        j_mirna, j_state = [x.strip() for x in jump_lab.split("·", 1)]
+                        # Parse oxidized positions from the matching row
+                        j_row = show[
+                            (show["mirna"] == j_mirna)
+                            & (show["oxidation_state"] == j_state)
+                        ].iloc[0]
+                        raw_pos = str(j_row.get("oxidized_positions", "") or "")
+                        digits = [
+                            int(x) for x in raw_pos.split(",") if x.strip().isdigit()
+                        ]
+                        if j_state == "none":
+                            digits = []
+                        cja, cjb = st.columns([1, 2])
+                        with cja:
+                            if st.button(
+                                "Load into Explorer",
+                                type="primary",
+                                key="gene_tab_jump_btn",
+                                help="Set sidebar miRNA (+ Single-state oxidation positions).",
+                            ):
+                                st.session_state["_jump_mirna"] = j_mirna
+                                st.session_state["_jump_ox_positions"] = digits
+                                st.rerun()
+                        with cjb:
+                            st.caption(
+                                f"Will set sidebar → **{j_mirna}**"
+                                + (
+                                    f", Single state ox → positions {digits}"
+                                    if digits
+                                    else ", Single state ox → none"
+                                )
+                            )
+
                     st.download_button(
                         "⬇ Download miRNA/oxomiR hits (CSV)",
                         show.to_csv(index=False),
@@ -471,10 +742,282 @@ with tab_gene:
                         mime="text/csv",
                     )
 
+# ===== TAB 5: external DB comparison + UpSet =====
+elif _SECTION == "External DB comparison":
+    st.markdown("#### Multi-database target comparison")
+    st.caption(
+        "Compare **any Explorer oxidation state** (unmodified or o8G) to open external "
+        "resources. External DBs only catalog **unmodified** miRNAs — useful for asking "
+        "which oxomiR targets are novel vs already known wild-type targets. "
+        "Predicted: TargetScan 8 / miRDB≥80 / DIANA-microT≥0.7 / miRmap top-quintile. "
+        "Experimental: ENCORI CLIP (API) and miRTarBase strong evidence (if a local "
+        "`paper/data/mirtarbase/hsa_MTI*` file is present)."
+    )
+    db_state = st.selectbox(
+        "Explorer oxidation state",
+        state_labels,
+        index=0,
+        key="ext_db_explorer_state",
+        help="External databases stay on the unmodified mature miRNA; only Explorer changes with o8G.",
+    )
+    st.markdown(
+        seed_html(
+            seed,
+            set(next(s for s in states if s.label == db_state).oxidized_positions),
+        ),
+        unsafe_allow_html=True,
+    )
+    include_unmod_explorer = st.checkbox(
+        "Also include Explorer unmodified (`none`) as a separate set",
+        value=(db_state != "none"),
+        help="When comparing an oxidized state, keep the wild-type Explorer list in the UpSet "
+             "so gained/lost vs external DBs is visible.",
+    )
+    avail = refsets.available_tools()
+    default_tools = [t for t, ok in avail.items() if ok and t != "miRTarBase"]
+    if avail.get("miRTarBase"):
+        default_tools.append("miRTarBase")
+    tool_opts = ["Explorer"] + list(refsets.LOADERS.keys())
+    chosen = st.multiselect(
+        "Databases to compare",
+        tool_opts,
+        default=["Explorer"] + default_tools[:4],
+        help="Explorer uses the sidebar precision mode on the oxidation state selected above.",
+    )
+    min_dbs = st.slider(
+        "Master list: gene must appear in at least this many selected DBs",
+        min_value=2,
+        max_value=max(2, len(chosen) + (1 if include_unmod_explorer and db_state != "none" else 0)),
+        value=2,
+        help="Raise to the number of sets for a strict intersection (present in every selected DB).",
+    )
+
+    if len(chosen) < 2 and not (include_unmod_explorer and "Explorer" in chosen):
+        st.info("Select at least two databases (or Explorer + unmodified Explorer).")
+    else:
+        with st.spinner(f"Loading reference sets for {mirna} [{db_state}]…"):
+            sets: dict[str, set] = {}
+            ours = pd.DataFrame()
+            ours_unmod = pd.DataFrame()
+
+            def _load_explorer(label: str) -> pd.DataFrame:
+                df = db.targets_filtered(
+                    seed, label, precision_cfg,
+                    scanner=None, mature_dna=info["seq_dna"], mirna=mirna,
+                )
+                if "site_rank" in df.columns:
+                    df = df[df["site_rank"] >= min_rank]
+                return df
+
+            if "Explorer" in chosen:
+                ours = _load_explorer(db_state)
+                label_key = f"Explorer ({db_state})"
+                sets[label_key] = set(ours["symbol"])
+            if include_unmod_explorer and db_state != "none":
+                ours_unmod = _load_explorer("none")
+                sets["Explorer (none)"] = set(ours_unmod["symbol"])
+            ext = refsets.load_selected(mirna, [t for t in chosen if t != "Explorer"])
+            sets.update(ext)
+
+        n_sets = len(sets)
+        if n_sets < 2:
+            st.info("Need at least two non-empty sets to compare.")
+        else:
+            # Set sizes — one row per set. Do not pack metrics into 4 columns with
+            # i%4 (Streamlit overwrites cards and makes fixed external DBs look like
+            # they changed when only Explorer's label/order shifts).
+            size_rows = []
+            for name, s in sets.items():
+                base = name.split(" (")[0]
+                meta = refsets.TOOL_META.get(base, {})
+                if name.startswith("Explorer (") and name != "Explorer (none)":
+                    ox_note = "yes — follows oxidation state selector"
+                elif name == "Explorer (none)":
+                    ox_note = "fixed — Explorer unmodified (`none`)"
+                else:
+                    ox_note = "no — unmodified miRNA catalog (same for every o8G state)"
+                size_rows.append(
+                    {
+                        "set": name,
+                        "n_genes": len(s),
+                        "changes_with_oxidation": ox_note,
+                        "threshold": meta.get("threshold", ""),
+                    }
+                )
+            st.markdown("#### Set sizes")
+            st.caption(
+                "Only **Explorer (o8G…)** changes when you switch oxidation state. "
+                "TargetScan / miRDB / DIANA / miRmap / ENCORI counts stay fixed for this miRNA. "
+                "The UpSet bars and master list *do* change, because intersections with Explorer change."
+            )
+            st.dataframe(pd.DataFrame(size_rows), hide_index=True, width="stretch")
+
+            empty_local = [
+                t for t in chosen
+                if t not in ("Explorer", "ENCORI") and not avail.get(t, False)
+            ]
+            if empty_local:
+                st.warning(
+                    "Local files missing for: **" + ", ".join(empty_local) + "**. "
+                    "Place downloads under `paper/data/` (see `o8g_refsets.py` docstring)."
+                )
+
+            mat = refsets.membership_matrix(sets)
+            if mat.empty:
+                st.warning("No genes loaded from the selected databases.")
+            else:
+                # clamp min_dbs to available sets
+                min_use = min(min_dbs, n_sets)
+                core = refsets.consensus_intersection(sets, min_dbs=min_use)
+                st.markdown(
+                    f"#### Master comparison list "
+                    f"({len(core)} genes in ≥{min_use} of {n_sets} sets) · Explorer state `{db_state}`"
+                )
+                master = mat[mat["n_dbs"] >= min_use].copy()
+                # BE from the selected Explorer state when available
+                be_src = ours if not ours.empty else ours_unmod
+                if not be_src.empty:
+                    be_lab = db_state if not ours.empty else "none"
+                    be_ann = enrich_binding(be_src, label=be_lab, sort=False).drop_duplicates(
+                        "symbol"
+                    )
+                    be = be_ann.set_index("symbol")["binding_efficiency"]
+                    master["binding_efficiency"] = master["symbol"].map(be)
+                    for col in ("dG_RNAduplex", "dG_RNAup", "contextpp_TargetScan"):
+                        if col in be_ann.columns:
+                            master[col] = master["symbol"].map(be_ann.set_index("symbol")[col])
+                    master = master.sort_values(
+                        ["n_dbs", "binding_efficiency"],
+                        ascending=[False, False],
+                        na_position="last",
+                    )
+                else:
+                    master = master.sort_values(["n_dbs", "symbol"], ascending=[False, True])
+
+                # flag genes gained on oxidation vs unmodified Explorer (when both present)
+                if "Explorer (none)" in sets and any(k.startswith("Explorer (") and k != "Explorer (none)" for k in sets):
+                    ox_key = next(k for k in sets if k.startswith("Explorer (") and k != "Explorer (none)")
+                    master["vs_unmodified_explorer"] = np.where(
+                        master["symbol"].isin(sets[ox_key] - sets["Explorer (none)"]),
+                        "gained on oxidation",
+                        np.where(
+                            master["symbol"].isin(sets["Explorer (none)"] - sets[ox_key]),
+                            "lost on oxidation",
+                            np.where(
+                                master["symbol"].isin(sets[ox_key] & sets["Explorer (none)"]),
+                                "shared",
+                                "external only",
+                            ),
+                        ),
+                    )
+
+                st.dataframe(master, width="stretch", height=360, hide_index=True)
+                st.download_button(
+                    "⬇ Download master comparison list (CSV)",
+                    master.to_csv(index=False),
+                    file_name=f"{mirna}_{db_state}_multidb_master_min{min_use}.csv",
+                    mime="text/csv",
+                )
+
+                st.markdown("#### UpSet plot (exclusive intersections)")
+                fig_u = plots.upset_plotly(sets)
+                st.plotly_chart(fig_u, width="stretch")
+
+                with st.expander("Database versions & thresholds"):
+                    meta_rows = []
+                    for name in sets:
+                        base = name.split(" (")[0]
+                        m = refsets.TOOL_META.get(base, {})
+                        meta_rows.append(
+                            {
+                                "set": name,
+                                "kind": m.get("kind", "predicted"),
+                                "version": m.get("version", ""),
+                                "threshold": m.get("threshold", ""),
+                                "citation": m.get("citation", ""),
+                                "n_genes": len(sets[name]),
+                            }
+                        )
+                    st.dataframe(pd.DataFrame(meta_rows), hide_index=True, width="stretch")
+
+                # ---- Additive: prioritize Explorer-lost genes with external WT support ----
+                ox_keys = [k for k in sets if k.startswith("Explorer (") and k != "Explorer (none)"]
+                if db_state != "none" and "Explorer (none)" in sets and ox_keys:
+                    ox_key = ox_keys[0]
+                    lost_syms = sets["Explorer (none)"] - sets[ox_key]
+                    ext_only = {k: v for k, v in sets.items() if not k.startswith("Explorer")}
+                    if lost_syms and ext_only:
+                        st.markdown("#### Predicted lost targets (external corroboration)")
+                        st.caption(
+                            "Same comparison as above, filtered to genes **lost on oxidation** "
+                            "(in Explorer unmodified, absent after the selected o8G state). "
+                            "`n_external` counts how many selected WT catalogs list each gene. "
+                            "Explorer is strongest at loss-of-binding; use this list for follow-up."
+                        )
+                        min_ext = st.slider(
+                            "Lost list: require support from at least this many external DBs",
+                            min_value=0,
+                            max_value=max(1, len(ext_only)),
+                            value=1,
+                            key="ext_lost_min_support",
+                        )
+                        unmod_src = ours_unmod if not ours_unmod.empty else ours
+                        unmod_ann = (
+                            enrich_binding(unmod_src, label="none", sort=False)
+                            .drop_duplicates("symbol")
+                            .set_index("symbol")
+                        )
+                        support = refsets.external_support_for_genes(lost_syms, ext_only)
+                        lost_tbl = support[support["n_external"] >= min_ext].copy()
+                        if "gene_id" in unmod_ann.columns:
+                            lost_tbl["gene_id"] = lost_tbl["symbol"].map(unmod_ann["gene_id"])
+                        if "site_type" in unmod_ann.columns:
+                            lost_tbl["site_unmodified"] = lost_tbl["symbol"].map(
+                                unmod_ann["site_type"]
+                            )
+                        lost_tbl["binding_efficiency"] = lost_tbl["symbol"].map(
+                            unmod_ann["binding_efficiency"]
+                        )
+                        for col in ("dG_RNAduplex", "dG_RNAup", "contextpp_TargetScan"):
+                            if col in unmod_ann.columns:
+                                lost_tbl[col] = lost_tbl["symbol"].map(unmod_ann[col])
+                        lost_tbl = lost_tbl.sort_values(
+                            ["n_external", "binding_efficiency"],
+                            ascending=[False, False],
+                            na_position="last",
+                        )
+                        lead = [
+                            "symbol", "gene_id", "site_unmodified",
+                            "n_external", "binding_efficiency",
+                            "dG_RNAduplex", "dG_RNAup", "contextpp_TargetScan",
+                        ]
+                        flags = [c for c in ext_only if c in lost_tbl.columns]
+                        lost_tbl = lost_tbl[[c for c in lead if c in lost_tbl.columns] + flags]
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("Explorer lost", len(lost_syms))
+                        c2.metric("Lost ∩ ≥1 external", int((support["n_external"] >= 1).sum()))
+                        c3.metric(f"Shown (≥{min_ext})", len(lost_tbl))
+                        st.dataframe(lost_tbl, width="stretch", height=320, hide_index=True)
+                        st.download_button(
+                            "⬇ Download lost targets + external support (CSV)",
+                            lost_tbl.to_csv(index=False),
+                            file_name=f"{mirna}_{db_state}_lost_external_min{min_ext}.csv",
+                            mime="text/csv",
+                            key="dl_lost_ext",
+                        )
+                    elif lost_syms and not ext_only:
+                        st.info(
+                            "Select at least one external database above to annotate "
+                            f"the {len(lost_syms)} Explorer-lost genes."
+                        )
+
 st.markdown("---")
 st.caption("Prediction: seed positions 2–8; unoxidized G pairs C, 8-oxoG (o8G) pairs A "
            "(Hoogsteen). Targets = TargetScan-style 6mer/7mer/8mer sites in human 3′UTRs "
            "(longest per gene, Ensembl). Enrichment = hypergeometric ORA, BH-corrected. "
            "Large seed-match target lists yield broad enrichment — interpret pathway shifts, "
            "not absolute significance, and validate candidates experimentally. "
-           "Gene ID resolution uses a locally cached NCBI/HGNC map (no runtime API).")
+           "Gene ID resolution uses a locally cached NCBI/HGNC map (no runtime API). "
+           "External DB comparison uses local TargetScan/miRDB/DIANA/miRmap files when present "
+           "plus the ENCORI open API; an optional lost-gene list ranks Explorer losses by "
+           "external WT support. Ranking uses the binding-efficiency formula in o8g_binding.py.")

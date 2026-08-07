@@ -253,3 +253,98 @@ def _short(s, n=40):
     s = re.sub(r"\s*\((GO:\d+)\)$", "", s)
     s = re.sub(r"\s+R-HSA-\d+$", "", s)
     return s if len(s) <= n else s[:n-1] + "\u2026"
+
+
+def upset_plotly(sets: dict[str, set], max_intersections: int = 40):
+    """UpSet-style plot of gene-set intersections (plotly; no extra dependency).
+
+    Top panel: intersection sizes (sorted desc).
+    Bottom panel: which sets participate (dot matrix).
+    """
+    import itertools
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    names = list(sets.keys())
+    if len(names) < 2:
+        fig = go.Figure()
+        fig.update_layout(title="Need ≥2 databases for an UpSet plot")
+        return fig
+
+    # exclusive intersections for every non-empty subset
+    rows = []
+    for r in range(1, len(names) + 1):
+        for combo in itertools.combinations(names, r):
+            combo = list(combo)
+            inter = set.intersection(*(sets[n] for n in combo))
+            # exclusive: remove genes also in databases outside the combo
+            outside = [n for n in names if n not in combo]
+            if outside:
+                union_out = set.union(*(sets[n] for n in outside)) if outside else set()
+                inter = inter - union_out
+            if not inter:
+                continue
+            rows.append({"combo": combo, "size": len(inter), "degree": len(combo)})
+
+    if not rows:
+        fig = go.Figure()
+        fig.update_layout(title="No non-empty intersections")
+        return fig
+
+    rows.sort(key=lambda x: (-x["size"], -x["degree"]))
+    rows = rows[:max_intersections]
+    labels = [" ∩ ".join(r["combo"]) for r in rows]
+    sizes = [r["size"] for r in rows]
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        row_heights=[0.55, 0.45],
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        subplot_titles=("Intersection size", "Set membership"),
+    )
+    fig.add_trace(
+        go.Bar(x=list(range(len(rows))), y=sizes, marker_color="#4C72B0", name="size",
+               text=sizes, textposition="outside"),
+        row=1, col=1,
+    )
+    # membership matrix as scatter
+    xs, ys, colors = [], [], []
+    for i, r in enumerate(rows):
+        for j, name in enumerate(names):
+            xs.append(i)
+            ys.append(j)
+            colors.append("#F5F5F5" if name in r["combo"] else "#2A2A2A")
+            # light = in set (positive); dark = out (negative) — readable on dark UI
+    fig.add_trace(
+        go.Scatter(
+            x=xs, y=ys, mode="markers",
+            marker=dict(
+                size=12,
+                color=colors,
+                line=dict(width=1, color="#888888"),
+            ),
+            showlegend=False, hoverinfo="skip",
+        ),
+        row=2, col=1,
+    )
+    fig.update_xaxes(showticklabels=False, row=1, col=1)
+    fig.update_xaxes(
+        tickmode="array",
+        tickvals=list(range(len(rows))),
+        ticktext=[_short(lb, 28) for lb in labels],
+        tickangle=-55,
+        row=2, col=1,
+    )
+    fig.update_yaxes(title_text="n genes", row=1, col=1)
+    fig.update_yaxes(
+        tickmode="array", tickvals=list(range(len(names))), ticktext=names, row=2, col=1
+    )
+    fig.update_layout(
+        template="simple_white",
+        height=420 + 28 * len(names),
+        margin=dict(b=120),
+        title="UpSet — exclusive intersections across databases",
+    )
+    return fig

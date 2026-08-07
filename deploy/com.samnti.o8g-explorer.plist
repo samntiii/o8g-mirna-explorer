@@ -6,6 +6,13 @@
   <string>com.samnti.o8g-explorer</string>
   <key>WorkingDirectory</key>
   <string>/Users/santiago/o8g_mirna_explorer</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/santiago</string>
+  </dict>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
@@ -15,6 +22,8 @@
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
   <key>StandardOutPath</key>
   <string>/Users/santiago/o8g_mirna_explorer/pids/launchd.out.log</string>
   <key>StandardErrorPath</key>

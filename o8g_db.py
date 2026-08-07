@@ -20,12 +20,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from o8g_precision import (
-    PrecisionConfig,
-    PrecisionMode,
-    apply_precision_filter,
-    partition_after_filter,
-)
+import o8g_precision as _o8g_precision
+from o8g_precision import PrecisionConfig, PrecisionMode, partition_after_filter
+
+
+def _apply_precision_filter(*args, **kwargs):
+    """Call through the live module so Streamlit reloads always take effect."""
+    return _o8g_precision.apply_precision_filter(*args, **kwargs)
 
 RANK_SITE = {4: "8mer", 3: "7mer-m8", 2: "7mer-A1", 1: "6mer"}
 
@@ -216,6 +217,7 @@ class TargetDB:
             if not live.empty:
                 keep = [
                     "symbol",
+                    "gene_idx",
                     "n_8mer",
                     "n_7mer_m8",
                     "n_sites",
@@ -223,9 +225,10 @@ class TargetDB:
                     "context_score",
                     "site_rank",
                     "site_type",
+                    "site_start",
                     "gene_id",
                 ]
-                live = live[keep]
+                live = live[[c for c in keep if c in live.columns]]
                 df = live.merge(
                     df[["symbol", "is_conserved"]],
                     on="symbol",
@@ -247,9 +250,9 @@ class TargetDB:
         conserved_symbols: set[str] | None = None,
         mirna: str | None = None,
     ) -> pd.DataFrame:
-        if not isinstance(cfg, PrecisionConfig):
-            cfg = PrecisionConfig.from_mode(cfg)
-        if conserved_symbols is None and cfg.mode == PrecisionMode.CONSENSUS and mirna:
+        # Always re-hydrate onto this module's PrecisionConfig (Streamlit reload-safe)
+        cfg = PrecisionConfig.from_mode(cfg)
+        if conserved_symbols is None and str(getattr(cfg.mode, "value", cfg.mode)) == PrecisionMode.CONSENSUS.value and mirna:
             try:
                 from conservation import get_conserved_index, build_seed_family_map
 
@@ -265,7 +268,7 @@ class TargetDB:
             mature_dna=mature_dna,
             conserved_symbols=conserved_symbols,
         )
-        return apply_precision_filter(
+        return _apply_precision_filter(
             df,
             cfg,
             conserved_symbols=conserved_symbols,
@@ -280,11 +283,10 @@ class TargetDB:
         **kwargs,
     ) -> dict[str, set[str]]:
         """Partition unmod vs oxidized after filtering both sides."""
-        if not isinstance(cfg, PrecisionConfig):
-            cfg = PrecisionConfig.from_mode(cfg)
+        cfg = PrecisionConfig.from_mode(cfg)
         mirna = kwargs.get("mirna")
         conserved_symbols = kwargs.get("conserved_symbols")
-        if conserved_symbols is None and cfg.mode == PrecisionMode.CONSENSUS and mirna:
+        if conserved_symbols is None and str(getattr(cfg.mode, "value", cfg.mode)) == PrecisionMode.CONSENSUS.value and mirna:
             try:
                 from conservation import get_conserved_index, build_seed_family_map
 

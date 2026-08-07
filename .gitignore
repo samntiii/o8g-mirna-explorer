@@ -46,3 +46,4 @@ cloudflared-credentials.json
 
 # OS / editor
 .cursor/
+RNA_*.out

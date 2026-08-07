@@ -59,18 +59,49 @@ _MODE_ALIASES = {
 }
 
 
+def _coerce_mode(mode: PrecisionMode | str | object) -> PrecisionMode:
+    """Normalize to PrecisionMode; survive Streamlit module reloads (enum identity)."""
+    if isinstance(mode, PrecisionMode):
+        return mode
+    # Enum-like from a reloaded module (same name/value, different class object)
+    if hasattr(mode, "value") and not hasattr(mode, "mode"):
+        try:
+            return PrecisionMode(str(getattr(mode, "value")))
+        except Exception:
+            pass
+    if isinstance(mode, str):
+        mode = _MODE_ALIASES.get(mode, mode)
+        return mode if isinstance(mode, PrecisionMode) else PrecisionMode(mode)
+    # Nested / mistaken PrecisionConfig passed as mode
+    if hasattr(mode, "mode"):
+        return _coerce_mode(getattr(mode, "mode"))
+    raise TypeError(f"Cannot coerce precision mode from {type(mode)!r}: {mode!r}")
+
+
 @dataclass(frozen=True)
 class PrecisionConfig:
     mode: PrecisionMode = PrecisionMode.SENSITIVE
     use_conservation: bool = True
 
     @staticmethod
-    def from_mode(mode: PrecisionMode | str, **kwargs) -> "PrecisionConfig":
-        if isinstance(mode, str):
-            mode = _MODE_ALIASES.get(mode, mode)
-            if not isinstance(mode, PrecisionMode):
-                mode = PrecisionMode(mode)
-        return PrecisionConfig(mode=mode, **kwargs)
+    def from_mode(mode: PrecisionMode | str | "PrecisionConfig", **kwargs) -> "PrecisionConfig":
+        # Streamlit hot-reload can produce a *different* PrecisionConfig class object;
+        # treat duck-typed configs as already built.
+        if isinstance(mode, PrecisionConfig) or (
+            type(mode).__name__ == "PrecisionConfig" and hasattr(mode, "mode")
+        ):
+            if kwargs:
+                return PrecisionConfig(
+                    mode=_coerce_mode(getattr(mode, "mode")),
+                    use_conservation=kwargs.get(
+                        "use_conservation", getattr(mode, "use_conservation", True)
+                    ),
+                )
+            return PrecisionConfig(
+                mode=_coerce_mode(getattr(mode, "mode")),
+                use_conservation=bool(getattr(mode, "use_conservation", True)),
+            )
+        return PrecisionConfig(mode=_coerce_mode(mode), **kwargs)
 
     @staticmethod
     def ui_default() -> "PrecisionConfig":
@@ -106,15 +137,17 @@ def apply_precision_filter(
     if df is None or df.empty:
         return df.iloc[0:0].copy() if df is not None else pd.DataFrame()
 
+    cfg = PrecisionConfig.from_mode(cfg)
     out = df
     use_cons = cfg.use_conservation and env_flag("O8G_USE_CONSERVATION", True)
 
-    mode = cfg.mode
-    if mode == PrecisionMode.SENSITIVE:
+    # Compare by *value* string — never by enum identity (Streamlit reload-safe).
+    mode_s = str(_coerce_mode(cfg.mode).value)
+    if mode_s == PrecisionMode.SENSITIVE.value:
         out = out[out["site_rank"] >= 3]
-    elif mode == PrecisionMode.STRINGENT:
+    elif mode_s == PrecisionMode.STRINGENT.value:
         out = out[out["site_rank"] >= 4]
-    elif mode == PrecisionMode.CONSENSUS:
+    elif mode_s == PrecisionMode.CONSENSUS.value:
         out = out[out["site_rank"] >= 3]
         if use_cons and is_unmodified_state:
             if "is_conserved" in out.columns:
@@ -123,7 +156,7 @@ def apply_precision_filter(
                 out = out[out["symbol"].isin(conserved_symbols)]
         # oxidized: rank gate only (TargetScan has no o8G motifs)
     else:
-        raise ValueError(mode)
+        raise ValueError(f"Unknown precision mode: {mode_s!r}")
 
     return out.reset_index(drop=True)
 
@@ -143,7 +176,7 @@ def partition_after_filter(
     rank-filtered unmodified set — so gains remain true o8G retargeting events,
     not artifacts of dropping non-conserved unmodified targets.
     """
-    if cfg.mode != PrecisionMode.CONSENSUS:
+    if str(getattr(cfg.mode, "value", cfg.mode)) != PrecisionMode.CONSENSUS.value:
         u = apply_precision_filter(
             unmod, cfg, conserved_symbols=conserved_symbols, is_unmodified_state=True
         )
