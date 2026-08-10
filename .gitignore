@@ -17,6 +17,12 @@ o8g_targets.db
 o8g_targets.db-*
 o8g_reverse.db
 o8g_reverse.db-*
+o8g_targetscan.db
+o8g_targetscan.db-*
+o8g_confident.db
+o8g_confident.db-*
+mirdb_ref.parquet
+mirdb_custom_cache.db
 o8g_states.parquet
 utr3_human.parquet
 hsa_mature.parquet

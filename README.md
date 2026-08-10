@@ -14,6 +14,10 @@ Foundry tunnel.
 > normal or o8G, giving **2^k** target repertoires per miRNA. Details in
 > `VALIDATION_REPORT.md` and the in-app Methods caption.
 
+## Manuscript (NAR Database Issue)
+
+Submission-facing prose + figures: [`manuscript/`](manuscript/) (symlinks into `paper/`).
+
 ## Quick start
 
 ```bash
@@ -41,16 +45,30 @@ Single Streamlit app (`app.py`). Views are a **radio switch** (not tabs) so only
 the active section runs — Streamlit re-executes the whole script on every
 widget change.
 
-| View | What it does |
-|---|---|
-| **Single state — targets** | One miRNA oxidation state; BE ranking; optional ViennaRNA / TargetScan energetics |
-| **Compare two states** | Lost / gained / shared genes + pathway volcano |
-| **All states** | Heatmap / enrichment across every o8G combination |
-| **Gene → miRNA/oxomiR** | Reverse lookup (symbol / Ensembl / Entrez); optional duplex / RNAup / context++ on the first *N* rows |
-| **External DB comparison** | Explorer vs TargetScan / miRDB / DIANA / miRmap / ENCORI / miRTarBase (UpSet + master list) |
+| View | What it does | Optional data |
+|---|---|---|
+| **Single state — targets** | One miRNA oxidation state; BE ranking; optional ViennaRNA / TargetScan energetics | `utr3_human.parquet`, ViennaRNA |
+| **Compare two states** | Lost / gained / shared genes + pathway volcano **with within-pool control** | `genesets/` |
+| **All states** | Heatmap / enrichment across every o8G combination | `genesets/` |
+| **Overlap (Venn/UpSet)** | Multi-state set overlap after precision filtering | — |
+| **Transcription factors** | TF genes among gained/lost/retained; optional one-hop amplification | TF GMTs under `genesets/` |
+| **Loss of function** | miRDB-anchored attrition (gained≡0 is structural) | `mirdb_ref.parquet` |
+| **Statistics** | ORA (± optional GSEA) with UTR-universe + within-pool backgrounds | `genesets/`, `gseapy` |
+| **Antagomir design** | Oligo discrimination scores (G→U proxy for o8G ΔG) | ViennaRNA optional |
+| **Gene → miRNA/oxomiR** | Reverse lookup (symbol / Ensembl / Entrez) | `gene_aliases.parquet`, `o8g_reverse.db` |
+| **External DB comparison** | Explorer vs TargetScan / miRDB / DIANA / miRmap / ENCORI / miRTarBase | local ref files / ENCORI API |
 
 **Sidebar.** Precision mode (**Sensitive** / **Stringent** / **Consensus**),
 pathway library, and an optional min site-quality floor.
+
+**Consensus requires** `paper/data/Conserved_Family_Info.txt` (TargetScanHuman
+8.0). If that file is missing the app **refuses Consensus** (persistent banner)
+and falls back to Sensitive — it does **not** silently intersect with an empty
+conserved set.
+
+Large SQLite / parquet assets (`o8g_targets.db`, `o8g_targetscan.db`,
+`o8g_confident.db`, `mirdb_ref.parquet`, …) are gitignored; views that need a
+missing file say which path is required instead of raising.
 
 Energetics checkboxes default **off** (RNAduplex / RNAup / TargetScan scans are
 expensive). Turn them on only when you need the columns.
@@ -75,16 +93,18 @@ Site-type / gained–lost calls use the biological **G·C → o8G·A** rule and 
 
 | File | Role |
 |---|---|
-| `app.py` | Streamlit explorer |
+| `app.py` | Streamlit explorer (10-section radio router) |
 | `o8g_engine.py` | Seed extraction, 2^k state enumeration, motifs |
 | `o8g_scanner.py` | k-mer index over 3′UTRs |
-| `o8g_db.py` | Read-only SQLite accessor (+ reverse gene query) |
+| `o8g_db.py` | Read-only SQLite accessor (+ reverse gene query; `ConservationUnavailable`) |
 | `o8g_precision.py` | Sensitive / Stringent / Consensus filters |
+| `o8g_sections.py` | `SectionContext` + dispatch for optional views |
+| `o8g_venn.py` / `o8g_tf.py` / `o8g_lof.py` / `o8g_stats.py` / `o8g_anti.py` / `o8g_energy.py` | Optional section views |
 | `o8g_binding.py` | Binding efficiency (BE) |
 | `o8g_thermo.py` | ViennaRNA + TargetScan context++ for target tables |
 | `o8g_pubthermo.py` | Publication-safe duplex / RNAup / context++ for Gene→miRNA |
 | `o8g_refsets.py` | External DB loaders (TargetScan, miRDB, DIANA, miRmap, ENCORI, miRTarBase) |
-| `o8g_enrich.py` | Hypergeometric ORA + BH |
+| `o8g_enrich.py` | Hypergeometric ORA + BH (+ within-pool control; TF libs) |
 | `o8g_plots.py` | Volcano, heatmap, diverging bar, dot plot, UpSet |
 | `o8g_genes.py` | Local gene ID resolver (NCBI/HGNC map) |
 | `conservation.py` | TargetScan conserved-family helpers for Consensus mode |

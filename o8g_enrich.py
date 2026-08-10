@@ -13,15 +13,25 @@ enrichment p-value is the upper-tail P(X >= k).  We report:
     overlap, query_size, term_size, expected, odds_ratio (fold enrichment),
     p_value, and Benjamini-Hochberg adjusted q_value per library.
 
-Compare mode
-------------
-compare_states(list_A, list_B, ...) runs enrichment on each list and merges on
-term, producing a tidy frame with -log10 q for each and a signed
-"delta_score" = sign_A_vs_B * combined significance, suitable for a volcano
-(x = log2 odds-ratio ratio, y = -log10 q) and a pathways x states heatmap.
+Background
+----------
+`background` may be:
+  - None  → library-union population (legacy; inflated for this app — prefer
+            the 3'UTR symbol universe from o8g_targets.db)
+  - int   → fixed population size N (legacy; term sizes unrestricted)
+  - iterable of symbols → restrict BOTH the population and the query to
+            set(background) ∩ (union of library gene sets). Term sizes are
+            likewise intersected with that pool. This is the correct path for
+            UTR-indexed target lists.
+
+Differential enrichments must also report a within-pool control
+(`enrich_within_pool`) whose background is union(unmodified, oxidized) —
+genome-wide ORA alone answers "what does this miRNA target", not "what did
+oxidation change".
 """
 from __future__ import annotations
 import glob, os, re
+from collections.abc import Iterable
 from functools import lru_cache
 import numpy as np
 import pandas as pd
@@ -36,7 +46,14 @@ LIBRARY_FILES = {
     "KEGG": "KEGG_2021_Human.gmt",
     "Reactome": "Reactome_2022.gmt",
     "Hallmark": "MSigDB_Hallmark_2020.gmt",
+    # TF / ChIP libraries (optional — views degrade if files absent)
+    "ChEA_TF": "ChEA_2022.gmt",
+    "ENCODE_TF": "ENCODE_TF_ChIP-seq_2015.gmt",
+    "TRRUST_TF": "TRRUST_Transcription_Factors_2019.gmt",
+    "TF_Perturb": "TF_Perturbations_Followed_by_Expression.gmt",
 }
+
+TF_LIBRARIES = ("ChEA_TF", "ENCODE_TF", "TRRUST_TF", "TF_Perturb")
 
 
 @lru_cache(maxsize=None)
@@ -57,40 +74,62 @@ def load_library(name: str) -> tuple:
 
 
 def available_libraries() -> list[str]:
-    return [k for k, v in LIBRARY_FILES.items()
-            if os.path.exists(os.path.join(GENESET_DIR, v))]
+    # Primary pathway libs first; TF libs available when present
+    primary = ["GO_BP", "GO_MF", "GO_CC", "KEGG", "Reactome", "Hallmark"]
+    out = [k for k in primary if k in LIBRARY_FILES
+           and os.path.exists(os.path.join(GENESET_DIR, LIBRARY_FILES[k]))]
+    for k in TF_LIBRARIES:
+        if k in LIBRARY_FILES and os.path.exists(os.path.join(GENESET_DIR, LIBRARY_FILES[k])):
+            out.append(k)
+    return out
 
 
-def enrich(query_genes, library: str = "GO_BP", background: int | None = None,
+def _library_universe(sets) -> set[str]:
+    allg: set[str] = set()
+    for s in sets:
+        allg |= s
+    return allg
+
+
+def enrich(query_genes, library: str = "GO_BP", background: int | Iterable | None = None,
            min_overlap: int = 2, top: int | None = None) -> pd.DataFrame:
     """Hypergeometric over-representation of `query_genes` in one library."""
     terms, sets = load_library(library)
-    Q = frozenset(g.upper() for g in query_genes)
-    q = len(Q)
-    # background = union of all genes in the library unless given
+    lib_u = _library_universe(sets)
+
     if background is None:
-        allg = set()
-        for s in sets:
-            allg |= s
-        N = len(allg)
+        pool = lib_u
+        N = len(pool)
+        restrict_terms = False
+    elif isinstance(background, (int, np.integer)):
+        pool = lib_u  # query still restricted to lib genes; N forced
+        N = int(background)
+        restrict_terms = False
     else:
-        N = background
+        bg = {str(g).upper() for g in background}
+        pool = bg & lib_u
+        N = len(pool)
+        restrict_terms = True
+
+    Q = frozenset(g.upper() for g in query_genes) & pool
+    q = len(Q)
     rows = []
-    for term, P in zip(terms, sets):
+    for term, P0 in zip(terms, sets):
+        P = (P0 & pool) if restrict_terms else P0
         k = len(Q & P)
         if k < min_overlap:
             continue
-        M = len(P)                       # term size
-        # P(X >= k) upper tail
+        M = len(P)
+        if M == 0 or N == 0 or q == 0:
+            continue
         pval = hypergeom.sf(k - 1, N, M, q)
         expected = q * M / N if N else np.nan
-        odds = (k / expected) if expected else np.nan   # fold enrichment
-        rows.append((term, k, q, M, expected, odds, pval))
+        odds = (k / expected) if expected else np.nan
+        rows.append((term, k, q, M, expected, odds, pval, N))
     df = pd.DataFrame(rows, columns=["term", "overlap", "query_size", "term_size",
-                                     "expected", "odds_ratio", "p_value"])
+                                     "expected", "odds_ratio", "p_value", "background_size"])
     if len(df):
         df = df.sort_values("p_value").reset_index(drop=True)
-        # Benjamini-Hochberg
         m = len(df)
         ranks = np.arange(1, m + 1)
         q_raw = df["p_value"].to_numpy() * m / ranks
@@ -106,9 +145,21 @@ def enrich(query_genes, library: str = "GO_BP", background: int | None = None,
     return df
 
 
+def enrich_within_pool(query_genes, pool_genes, library: str = "GO_BP",
+                       min_overlap: int = 2, top: int | None = None) -> pd.DataFrame:
+    """ORA against an explicit gene pool (e.g. union of unmod + oxidized targets).
+
+    This is the correct control for differential (lost/gained) enrichment:
+    genome-wide ORA alone answers 'what does this miRNA target', not
+    'what did oxidation change'.
+    """
+    return enrich(query_genes, library=library, background=pool_genes,
+                  min_overlap=min_overlap, top=top)
+
+
 def compare_states(genes_A, genes_B, library: str = "GO_BP",
                    label_A: str = "A", label_B: str = "B",
-                   background: int | None = None, min_overlap: int = 2) -> pd.DataFrame:
+                   background: int | Iterable | None = None, min_overlap: int = 2) -> pd.DataFrame:
     """Merge enrichment of two gene lists for differential (volcano/heatmap) views.
 
     Volcano axes:

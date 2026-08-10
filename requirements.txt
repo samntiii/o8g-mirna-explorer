@@ -7,3 +7,6 @@ plotly>=5.18
 matplotlib>=3.7
 ViennaRNA>=2.6
 openpyxl>=3.1
+requests>=2.31
+lxml>=5.0
+gseapy>=1.1

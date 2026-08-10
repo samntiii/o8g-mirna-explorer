@@ -35,6 +35,15 @@ _DEFAULT_REVERSE = _ROOT / "o8g_reverse.db"
 SCHEMA_VERSION_KEY = "schema_version"
 
 
+class ConservationUnavailable(RuntimeError):
+    """Raised when TargetScan conservation data cannot be loaded.
+
+    Never substitute an empty conserved set: Consensus intersects the
+    unmodified baseline with it, so an empty set silently collapses the
+    baseline to zero and reports every oxidized target as gained.
+    """
+
+
 def _primary_mirna(names: list[str]) -> str:
     if not names:
         return ""
@@ -239,6 +248,41 @@ class TargetDB:
             drop=True
         )
 
+    def _conserved_index(self):
+        from conservation import get_conserved_index
+
+        return get_conserved_index()
+
+    def _conserved_for(self, seed, mirna):
+        if not mirna:
+            raise ConservationUnavailable(
+                "Consensus mode needs the miRNA name to look up TargetScan "
+                "conserved families; none was supplied."
+            )
+        try:
+            from conservation import build_seed_family_map
+
+            fam = build_seed_family_map(self.path).get(seed)
+            syms = self._conserved_index().conserved_symbols_for_mirna(mirna, fam)
+        except FileNotFoundError as e:
+            raise ConservationUnavailable(
+                "Consensus mode requires paper/data/Conserved_Family_Info.txt "
+                "(TargetScanHuman 8.0), which is not installed. Use Sensitive "
+                "or Stringent, or add the TargetScan release files."
+            ) from e
+        except ConservationUnavailable:
+            raise
+        except Exception as e:
+            raise ConservationUnavailable(
+                f"Consensus conservation lookup failed ({type(e).__name__}): {e}"
+            ) from e
+        if not syms:
+            raise ConservationUnavailable(
+                f"TargetScan returned no conserved families for {mirna}; "
+                "refusing to run Consensus on an empty baseline."
+            )
+        return syms
+
     def targets_filtered(
         self,
         seed: str,
@@ -252,15 +296,11 @@ class TargetDB:
     ) -> pd.DataFrame:
         # Always re-hydrate onto this module's PrecisionConfig (Streamlit reload-safe)
         cfg = PrecisionConfig.from_mode(cfg)
-        if conserved_symbols is None and str(getattr(cfg.mode, "value", cfg.mode)) == PrecisionMode.CONSENSUS.value and mirna:
-            try:
-                from conservation import get_conserved_index, build_seed_family_map
-
-                idx = get_conserved_index()
-                fam = build_seed_family_map(self.path).get(seed)
-                conserved_symbols = idx.conserved_symbols_for_mirna(mirna, fam)
-            except Exception:
-                conserved_symbols = set()
+        if (
+            conserved_symbols is None
+            and str(getattr(cfg.mode, "value", cfg.mode)) == PrecisionMode.CONSENSUS.value
+        ):
+            conserved_symbols = self._conserved_for(seed, mirna)
         df = self.targets_enriched(
             seed,
             label,
@@ -286,15 +326,11 @@ class TargetDB:
         cfg = PrecisionConfig.from_mode(cfg)
         mirna = kwargs.get("mirna")
         conserved_symbols = kwargs.get("conserved_symbols")
-        if conserved_symbols is None and str(getattr(cfg.mode, "value", cfg.mode)) == PrecisionMode.CONSENSUS.value and mirna:
-            try:
-                from conservation import get_conserved_index, build_seed_family_map
-
-                idx = get_conserved_index()
-                fam = build_seed_family_map(self.path).get(seed)
-                conserved_symbols = idx.conserved_symbols_for_mirna(mirna, fam)
-            except Exception:
-                conserved_symbols = set()
+        if (
+            conserved_symbols is None
+            and str(getattr(cfg.mode, "value", cfg.mode)) == PrecisionMode.CONSENSUS.value
+        ):
+            conserved_symbols = self._conserved_for(seed, mirna)
         unmod = self.targets_enriched(
             seed,
             "none",

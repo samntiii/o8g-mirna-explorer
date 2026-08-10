@@ -452,7 +452,7 @@ def run_all_nulls(
             )
             assert s == p, (mode, effect, s, p)
 
-    return per_df, pd.DataFrame(pooled_rows), decoy_hist, pooled_hist
+    return per_df, pd.DataFrame(pooled_rows), decoy_hist, label_hist, pooled_hist
 
 
 def update_gold_summary_with_wilson():
@@ -677,7 +677,7 @@ def main():
     db = TargetDB(str(ROOT / "o8g_targets.db"))
     gold = load_gold_by_mirna()
 
-    per_df, pooled_df, decoy_hist, pooled_hist = run_all_nulls(
+    per_df, pooled_df, decoy_hist, label_hist, pooled_hist = run_all_nulls(
         db=db, scanner=scanner, gold=gold, n_decoy=n_decoy, rng=rng
     )
 
@@ -687,6 +687,62 @@ def main():
     pooled_df.to_csv(pool_path, index=False)
     print(f"\nWrote {per_path}", flush=True)
     print(f"Wrote {pool_path}", flush=True)
+
+    # Persist all permutation draws (NAR: no illustrative histograms)
+    draws_dir = BENCH / "null_draws"
+    draws_dir.mkdir(parents=True, exist_ok=True)
+    decoy_rows = []
+    label_rows = []
+    for (mir, mode, effect), arr in decoy_hist.items():
+        for i, v in enumerate(arr):
+            decoy_rows.append(
+                dict(mirna=mir, mode=mode, effect_type=effect, draw_i=i, count=int(v))
+            )
+    for (mir, mode, effect), arr in label_hist.items():
+        for i, v in enumerate(arr):
+            label_rows.append(
+                dict(mirna=mir, mode=mode, effect_type=effect, draw_i=i, count=int(v))
+            )
+    decoy_df = pd.DataFrame(decoy_rows)
+    label_df = pd.DataFrame(label_rows)
+    decoy_pq = draws_dir / "null_draws_decoy_per_mirna.parquet"
+    label_pq = draws_dir / "null_draws_labelperm_per_mirna.parquet"
+    decoy_df.to_parquet(decoy_pq, index=False)
+    label_df.to_parquet(label_pq, index=False)
+    print(f"Wrote {decoy_pq} ({len(decoy_df):,} rows)", flush=True)
+    print(f"Wrote {label_pq} ({len(label_df):,} rows)", flush=True)
+
+    # Pooled draws (sum across miRNAs within each draw_i)
+    pooled_draw_rows = []
+    for mode in PrecisionMode:
+        for effect in ("gained", "lost"):
+            keys = [(m, mode.value, effect) for m in gold.keys()]
+            decoy_pool = sum(decoy_hist[k] for k in keys)
+            label_pool = sum(label_hist[k] for k in keys)
+            for i, (d, l) in enumerate(zip(decoy_pool, label_pool)):
+                pooled_draw_rows.append(
+                    dict(
+                        mode=mode.value,
+                        effect_type=effect,
+                        draw_i=i,
+                        decoy_count=int(d),
+                        labelperm_count=int(l),
+                    )
+                )
+    pooled_draws = pd.DataFrame(pooled_draw_rows)
+    pooled_pq = draws_dir / "null_draws_pooled.parquet"
+    pooled_draws.to_parquet(pooled_pq, index=False)
+    print(f"Wrote {pooled_pq} ({len(pooled_draws):,} rows)", flush=True)
+
+    # Sanity: means from parquet match pooled CSV
+    for _, r in pooled_df.iterrows():
+        sub = pooled_draws[
+            (pooled_draws["mode"] == r["mode"])
+            & (pooled_draws["effect_type"] == r["effect_type"])
+        ]
+        m = float(sub["decoy_count"].mean())
+        assert abs(m - float(r["null_mean"])) < 1e-9, (r["mode"], r["effect_type"], m, r["null_mean"])
+    print("Persisted-draw means match nullmodel_pooled.csv", flush=True)
 
     update_gold_summary_with_wilson()
     plot_null_per_mirna(per_df, decoy_hist, FIGS / "figS_nullmodel.pdf")

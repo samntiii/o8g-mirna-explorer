@@ -20,8 +20,11 @@ import pandas as pd
 import streamlit as st
 
 from o8g_engine import extract_seed, enumerate_states, g_positions, SeedState
-from o8g_db import TargetDB
-from o8g_enrich import enrich, compare_states, available_libraries
+import o8g_db as _o8g_db
+import importlib as _importlib
+_o8g_db = _importlib.reload(_o8g_db)  # pick up ConservationUnavailable across hot-reloads
+from o8g_db import TargetDB, ConservationUnavailable
+from o8g_enrich import enrich, enrich_within_pool, compare_states, available_libraries
 from o8g_genes import ID_TYPES, GeneResolver
 from o8g_precision import PrecisionMode, PrecisionConfig
 from o8g_binding import add_binding_efficiency, FORMULA_CAPTION
@@ -29,9 +32,10 @@ from o8g_thermo import METRIC_CAPTION, vienna_available
 from o8g_pubthermo import annotate_gene_mirna_hits, PROVENANCE_CAPTION as PUBTHERMO_CAPTION
 import o8g_refsets as refsets
 import o8g_plots as plots
-import importlib as _importlib
+import o8g_sections as sections
 plots = _importlib.reload(plots)   # pick up edits to the plotting module on rerun
 refsets = _importlib.reload(refsets)
+sections = _importlib.reload(sections)
 
 st.set_page_config(page_title="o8G-miRNA Retargeting Explorer", layout="wide",
                    initial_sidebar_state="expanded")
@@ -42,7 +46,7 @@ RANK_LABEL = {1: "6mer", 2: "7mer-A1", 3: "7mer-m8", 4: "8mer"}
 
 # Bump when TargetDB / GeneResolver constructor API changes so Streamlit
 # drops stale @cache_resource instances across hot-reloads.
-_CACHE_VER = 13
+_CACHE_VER = 14
 
 
 @st.cache_resource
@@ -200,10 +204,45 @@ mode_name = st.sidebar.radio(
     ),
 )
 precision_cfg = PrecisionConfig.from_mode(mode_name)
+effective_mode = mode_name
 st.sidebar.caption(
     "Paper / claims: use **Stringent** or **Consensus**. "
     "Gained/lost are always computed after filtering both states."
 )
+
+
+@st.cache_data(show_spinner=False)
+def _conservation_status(_seed, _mirna, _ver=_CACHE_VER):
+    """Return "" if Consensus is usable, else the reason it is not."""
+    try:
+        db._conserved_for(_seed, _mirna)
+        return ""
+    except ConservationUnavailable as e:
+        return str(e)
+
+
+@st.cache_data(show_spinner=False)
+def _utr_universe(_ver=_CACHE_VER):
+    """Gene symbols with a 3'UTR in our index — correct ORA population."""
+    return set(str(s).upper() for s in db.symbols)
+
+
+_consensus_problem = ""
+if mode_name == PrecisionMode.CONSENSUS.value:
+    _consensus_problem = _conservation_status(seed, mirna)
+    if _consensus_problem:
+        precision_cfg = PrecisionConfig.from_mode("Sensitive")
+        effective_mode = "Sensitive (Consensus unavailable)"
+        st.sidebar.error("Consensus unavailable — showing Sensitive. " + _consensus_problem)
+
+universe = _utr_universe()
+
+
+def filtered_targets(label, **kw):
+    """Single entry point so no call site bypasses the precision ladder."""
+    return db.targets_filtered(seed, label, precision_cfg, mirna=mirna, **kw)
+
+
 # Do NOT build TargetScanner (~40s) on every page load — only when thermo / live
 # UTR scans are explicitly requested. Streamlit re-runs the whole script on each
 # widget change, so eager loading freezes every tab.
@@ -220,6 +259,8 @@ st.sidebar.caption("Applied on top of the precision mode (usually leave at 7mer-
 
 # ---------- main ----------
 st.title(f"{mirna}")
+if _consensus_problem:
+    st.error("Consensus unavailable — showing Sensitive. " + _consensus_problem)
 if len(gpos) == 0:
     st.info("This miRNA's seed contains no guanine, so 8-oxoG oxidation cannot alter its "
             "seed pairing — only one target list exists. Choose a G-containing seed to explore retargeting.")
@@ -238,12 +279,25 @@ _SECTION = st.radio(
         "Single state — targets",
         "Compare two states",
         "All states",
+        "Overlap (Venn/UpSet)",
+        "Transcription factors",
+        "Loss of function",
+        "Statistics",
+        "Antagomir design",
         "Gene → miRNA/oxomiR",
         "External DB comparison",
     ],
     horizontal=True,
     key="main_section",
 )
+
+_SECTION_DISPATCH = {
+    "Overlap (Venn/UpSet)": "render_overlap",
+    "Transcription factors": "render_tf",
+    "Loss of function": "render_lof",
+    "Statistics": "render_stats",
+    "Antagomir design": "render_antagomir",
+}
 
 # ===== TAB 1: single state target list =====
 if _SECTION == "Single state — targets":
@@ -279,14 +333,7 @@ if _SECTION == "Single state — targets":
             st.caption(f"Site inventory: {int(r['n_8mer'])} 8mer · {int(r['n_7mer_m8'])} 7mer-m8 · "
                        f"{int(r['n_7mer_A1'])} 7mer-A1 · {int(r['n_6mer'])} 6mer")
 
-    tdf = db.targets_filtered(
-        seed,
-        cur.label,
-        precision_cfg,
-        scanner=None,
-        mature_dna=info["seq_dna"],
-        mirna=mirna,
-    )
+    tdf = filtered_targets(cur.label, scanner=None, mature_dna=info["seq_dna"])
     if "site_rank" in tdf.columns:
         tdf = tdf[tdf["site_rank"] >= min_rank]
     score_targets_thermo = st.checkbox(
@@ -307,7 +354,7 @@ if _SECTION == "Single state — targets":
             tdf, label=cur.label, sort=True, with_thermo=False, scanner=None
         )
     st.markdown(
-        f"**{len(tdf)} predicted target genes** · mode `{precision_cfg.mode.value}` "
+        f"**{len(tdf)} predicted target genes** · mode `{effective_mode}` "
         f"(extra floor ≥ {RANK_LABEL[min_rank]})"
     )
     st.caption(FORMULA_CAPTION)
@@ -324,13 +371,14 @@ if _SECTION == "Single state — targets":
         "n_8mer", "n_7mer_m8", "score", "context_score", "is_conserved",
     ] if c in tdf.columns]
     st.dataframe(tdf[show_cols] if show_cols else tdf, width='stretch', height=320)
+    _mode_fn = effective_mode.replace(" ", "_").replace("(", "").replace(")", "")
     st.download_button("⬇ Download target list (CSV)", tdf.to_csv(index=False),
-                       file_name=f"{mirna}_{cur.label}_{precision_cfg.mode.value}_targets.csv", mime="text/csv")
+                       file_name=f"{mirna}_{cur.label}_{_mode_fn}_targets.csv", mime="text/csv")
 
     if len(tdf) >= 5:
         with st.spinner("Running pathway enrichment…"):
-            e = enrich(tdf["symbol"].tolist(), lib, top=20)
-        st.markdown(f"**Top {lib} pathways** (hypergeometric over-representation)")
+            e = enrich(tdf["symbol"].tolist(), lib, background=universe, top=20)
+        st.markdown(f"**Top {lib} pathways** (hypergeometric; background = 3′UTR universe, N={len(universe):,})")
         st.dataframe(e[["term","overlap","term_size","odds_ratio","p_value","q_value"]],
                      width='stretch', height=280)
 
@@ -347,12 +395,8 @@ elif _SECTION == "Compare two states":
         cc1.markdown(seed_html(seed, set(stA.oxidized_positions)), unsafe_allow_html=True)
         cc2.markdown(seed_html(seed, set(stB.oxidized_positions)), unsafe_allow_html=True)
 
-        tA = db.targets_filtered(
-            seed, sA, precision_cfg, scanner=None, mature_dna=info["seq_dna"], mirna=mirna
-        )
-        tB = db.targets_filtered(
-            seed, sB, precision_cfg, scanner=None, mature_dna=info["seq_dna"], mirna=mirna
-        )
+        tA = filtered_targets(sA, scanner=None, mature_dna=info["seq_dna"])
+        tB = filtered_targets(sB, scanner=None, mature_dna=info["seq_dna"])
         if "site_rank" in tA.columns:
             tA = tA[tA["site_rank"] >= max(min_rank, 3 if precision_cfg.mode != PrecisionMode.STRINGENT else 4)]
             tB = tB[tB["site_rank"] >= max(min_rank, 3 if precision_cfg.mode != PrecisionMode.STRINGENT else 4)]
@@ -369,7 +413,7 @@ elif _SECTION == "Compare two states":
         st.caption(
             f"**Lost** = targeted in `{sA}` but not `{sB}` · "
             f"**Gained** = new targets in `{sB}` · **Shared** = targeted in both. "
-            f"Precision mode `{precision_cfg.mode.value}` applied to each state before the set difference."
+            f"Precision mode `{effective_mode}` applied to each state before the set difference."
         )        # merge on symbol, carrying each state's best site type
         mA = tA.drop_duplicates("symbol").set_index("symbol")
         mB = tB.drop_duplicates("symbol").set_index("symbol")
@@ -430,29 +474,66 @@ elif _SECTION == "Compare two states":
             file_name=f"{mirna}_{sA}_vs_{sB}_differential_genes.csv", mime="text/csv")
 
         st.markdown("#### Differential pathway enrichment")
+        st.info(
+            "Genome-wide (UTR-universe) enrichment answers *what this miRNA targets*. "
+            "The **within-pool** control uses background = union(state A, state B) and "
+            "answers *what oxidation changed*. Never read the genome panel alone."
+        )
         chart = st.radio("Display", ["Diverging bar", "Volcano"], horizontal=True,
             help="Diverging bar names each pathway and shows direction directly — clearest "
                  "when few terms are significant. Volcano is better with many terms.")
         if len(sa) >= 5 and len(sb) >= 5:
+            pool = sa | sb
             with st.spinner("Computing differential pathway enrichment…"):
-                cmp = compare_states(gA, gB, library=lib, label_A=sA, label_B=sB, min_overlap=3)
+                cmp = compare_states(
+                    gA, gB, library=lib, label_A=sA, label_B=sB,
+                    background=universe, min_overlap=3,
+                )
                 cmp["log2_or"] = (-cmp["log2_or_ratio"]).clip(-8, 8)   # x>0 → toward A
                 cmp["q_value"] = cmp[[f"q_{sA}", f"q_{sB}"]].min(axis=1)
                 cmp["neglog10_q"] = cmp["neglog10_q_best"]
+                lost_genes = list(sa - sb)
+                gained_genes = list(sb - sa)
+                within_lost = enrich_within_pool(lost_genes, pool, library=lib, min_overlap=2, top=30)
+                within_gained = enrich_within_pool(gained_genes, pool, library=lib, min_overlap=2, top=30)
+            n_sig_genome = int((cmp["q_value"] < 0.05).sum()) if len(cmp) else 0
+            n_sig_pool = int(
+                ((within_lost["q_value"] < 0.05).sum() if len(within_lost) else 0)
+                + ((within_gained["q_value"] < 0.05).sum() if len(within_gained) else 0)
+            )
+            c_g, c_p = st.columns(2)
+            c_g.metric(f"Significant terms vs UTR universe (q<0.05)", n_sig_genome)
+            c_p.metric(f"Significant terms within target pool (q<0.05)", n_sig_pool)
             if chart == "Diverging bar":
                 fig = plots.diverging_bar_plotly(cmp, label_A=sA, label_B=sB, x_col="log2_or")
                 st.plotly_chart(fig, width='stretch')
                 st.caption(f"Each bar is a pathway; length = −log10 q. Right (red) = enriched in "
-                           f"**{sA}**; left (blue) = enriched in **{sB}**. Dashed lines = q<0.05.")
+                           f"**{sA}**; left (blue) = enriched in **{sB}**. Dashed lines = q<0.05. "
+                           f"Background = 3′UTR universe (N={len(universe):,}).")
             else:
                 fig = plots.volcano_plotly(cmp, label_A=sA, label_B=sB, x_col="log2_or")
                 st.plotly_chart(fig, width='stretch')
                 st.caption(f"Each point is a pathway. Right (red) = enriched in **{sA}**; "
-                           f"left (blue) = enriched in **{sB}**. Dashed line = q<0.05.")
+                           f"left (blue) = enriched in **{sB}**. Dashed line = q<0.05. "
+                           f"Background = 3′UTR universe (N={len(universe):,}).")
             st.dataframe(cmp.sort_values("neglog10_q_best", ascending=False)
                          [["term","library",f"overlap_{sA}",f"overlap_{sB}",
                            f"odds_{sA}",f"odds_{sB}","q_value"]].head(40),
                          width='stretch', height=300)
+            st.markdown("##### Within-pool control (lost / gained vs union of both states)")
+            wp1, wp2 = st.columns(2)
+            with wp1:
+                st.caption(f"Lost genes vs pool (n_pool={len(pool):,})")
+                st.dataframe(
+                    within_lost[["term", "overlap", "odds_ratio", "q_value"]] if len(within_lost) else within_lost,
+                    width="stretch", height=220,
+                )
+            with wp2:
+                st.caption(f"Gained genes vs pool (n_pool={len(pool):,})")
+                st.dataframe(
+                    within_gained[["term", "overlap", "odds_ratio", "q_value"]] if len(within_gained) else within_gained,
+                    width="stretch", height=220,
+                )
         else:
             st.warning("Need ≥5 strong-site targets in each state for enrichment.")
 
@@ -462,16 +543,24 @@ elif _SECTION == "All states":
         st.info("Only one state exists for a G-free seed.")
     else:
         st.markdown(f"Pathway enrichment (−log10 q) across all **{len(states)}** seed-oxidation "
-                    f"states of {mirna}, library **{lib}**.")
+                    f"states of {mirna}, library **{lib}** · mode `{effective_mode}` · "
+                    f"background = 3′UTR universe (N={len(universe):,}).")
         view = st.radio("Display", ["Heatmap", "Dot plot"], horizontal=True,
             help="Heatmap = enrichment intensity per state. Dot plot adds gene-overlap as dot "
                  "size, so you also see how many genes support each term in each state.")
         top_terms = st.slider("Pathways to show", 8, 40, 22)
-        sg = {s.label: db.target_symbols(seed, s.label, min_rank=max(min_rank,3)) for s in states}
+        def _enrich_utr(genes, library=lib, **kw):
+            return enrich(genes, library=library, background=universe, **kw)
+        sg = {}
+        for s in states:
+            df = filtered_targets(s.label, scanner=None, mature_dna=info["seq_dna"])
+            if "site_rank" in df.columns:
+                df = df[df["site_rank"] >= max(min_rank, 3)]
+            sg[s.label] = df["symbol"].tolist()
         states_order = [s.label for s in states]
         if view == "Heatmap":
             with st.spinner("Enriching all states…"):
-                mat = plots.enrichment_matrix(sg, enrich, library=lib, top_terms=top_terms)
+                mat = plots.enrichment_matrix(sg, _enrich_utr, library=lib, top_terms=top_terms)
             if mat.shape[0] >= 2:
                 fig = plots.heatmap_plotly(mat)
                 st.plotly_chart(fig, width='stretch')
@@ -481,7 +570,7 @@ elif _SECTION == "All states":
                 st.warning("Not enough enriched pathways to build a heatmap at this setting.")
         else:
             with st.spinner("Enriching all states…"):
-                long = plots.state_dotplot_data(sg, enrich, library=lib, top_terms=top_terms)
+                long = plots.state_dotplot_data(sg, _enrich_utr, library=lib, top_terms=top_terms)
             if long["term"].nunique() >= 2:
                 fig = plots.dotplot_plotly(long, states_order=states_order)
                 st.plotly_chart(fig, width='stretch')
@@ -491,6 +580,30 @@ elif _SECTION == "All states":
                                    file_name=f"{mirna}_state_dotplot_{lib}.csv", mime="text/csv")
             else:
                 st.warning("Not enough enriched pathways to build a dot plot at this setting.")
+
+elif _SECTION in _SECTION_DISPATCH:
+    def _strong_set(label: str) -> set[str]:
+        df = filtered_targets(label, scanner=None, mature_dna=info["seq_dna"])
+        if "site_rank" in df.columns:
+            floor = 4 if precision_cfg.mode == PrecisionMode.STRINGENT else max(min_rank, 3)
+            df = df[df["site_rank"] >= floor]
+        return set(df["symbol"].astype(str))
+
+    ctx = sections.SectionContext(
+        db=db,
+        mirna=mirna,
+        info=info,
+        seed=seed,
+        gpos=gpos,
+        state_labels=state_labels,
+        library=lib,
+        precision_mode=effective_mode,
+        strong_set=_strong_set,
+        universe=universe,
+        matched_background=universe,
+        external_refs=refsets,
+    )
+    getattr(sections, _SECTION_DISPATCH[_SECTION])(ctx)
 
 # ===== TAB 4: reverse gene → miRNA/oxomiR =====
 elif _SECTION == "Gene → miRNA/oxomiR":
@@ -784,13 +897,21 @@ elif _SECTION == "External DB comparison":
         default=["Explorer"] + default_tools[:4],
         help="Explorer uses the sidebar precision mode on the oxidation state selected above.",
     )
-    min_dbs = st.slider(
-        "Master list: gene must appear in at least this many selected DBs",
-        min_value=2,
-        max_value=max(2, len(chosen) + (1 if include_unmod_explorer and db_state != "none" else 0)),
-        value=2,
-        help="Raise to the number of sets for a strict intersection (present in every selected DB).",
+    n_est = len(chosen) + (
+        1 if include_unmod_explorer and db_state != "none" and "Explorer" in chosen else 0
     )
+    # Streamlit raises when min_value == max_value; two selected sets → fixed min_dbs=2.
+    if n_est > 2:
+        min_dbs = st.slider(
+            "Master list: gene must appear in at least this many selected DBs",
+            min_value=2,
+            max_value=n_est,
+            value=2,
+            help="Raise to the number of sets for a strict intersection (present in every selected DB).",
+        )
+    else:
+        min_dbs = 2
+        st.caption("Master list requires agreement of both selected databases.")
 
     if len(chosen) < 2 and not (include_unmod_explorer and "Explorer" in chosen):
         st.info("Select at least two databases (or Explorer + unmodified Explorer).")
@@ -801,10 +922,7 @@ elif _SECTION == "External DB comparison":
             ours_unmod = pd.DataFrame()
 
             def _load_explorer(label: str) -> pd.DataFrame:
-                df = db.targets_filtered(
-                    seed, label, precision_cfg,
-                    scanner=None, mature_dna=info["seq_dna"], mirna=mirna,
-                )
+                df = filtered_targets(label, scanner=None, mature_dna=info["seq_dna"])
                 if "site_rank" in df.columns:
                     df = df[df["site_rank"] >= min_rank]
                 return df
