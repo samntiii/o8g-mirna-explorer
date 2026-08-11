@@ -80,6 +80,7 @@ def score_mirna_states(
     single_g_only: bool = False,
     max_states: int = 32,
     down_weight: float = 0.0,
+    scanner=None,
 ) -> pd.DataFrame:
     """Rank oxidation states for one miRNA by UP∩lost (and optional DOWN∩gained) concordance."""
     info = db.mirna_info(mirna)
@@ -90,7 +91,7 @@ def score_mirna_states(
     p_up = []
     p_down = []
     for lab in labels:
-        parts = db.retarget_partition(seed, lab, cfg, mirna=mirna)
+        parts = db.retarget_partition(seed, lab, cfg, mirna=mirna, scanner=scanner)
         lost = {g.upper() for g in parts["lost"]}
         gained = {g.upper() for g in parts["gained"]}
         k_up, or_up, p_u = _fisher_overlap(up, lost, universe)
@@ -151,6 +152,7 @@ def score_panel(
     single_g_only: bool = False,
     max_states: int = 32,
     down_weight: float = 0.0,
+    scanner=None,
 ) -> pd.DataFrame:
     frames = []
     for mir in mirnas:
@@ -166,6 +168,7 @@ def score_panel(
                     single_g_only=single_g_only,
                     max_states=max_states,
                     down_weight=down_weight,
+                    scanner=scanner,
                 )
             )
         except Exception as e:

@@ -31,6 +31,9 @@ def main() -> int:
 
     print("Precision regression — miR-1-3p none vs o8G@7\n", flush=True)
     for mode in PrecisionMode:
+        if mode == PrecisionMode.TS_DENOVO and scanner is None:
+            print(f"  {mode.value:20s}  SKIP (set O8G_TEST_LIVE_SCANNER=1)", flush=True)
+            continue
         parts = db.retarget_partition(
             seed,
             "o8G@7",
@@ -40,7 +43,7 @@ def main() -> int:
             mirna=mirna,
         )
         print(
-            f"  {mode.value:10s}  gained={len(parts['gained']):5d}  "
+            f"  {mode.value:20s}  gained={len(parts['gained']):5d}  "
             f"lost={len(parts['lost']):5d}  shared={len(parts['shared']):5d}",
             flush=True,
         )
@@ -48,6 +51,7 @@ def main() -> int:
             PrecisionMode.SENSITIVE: (500, 500, 500),
             PrecisionMode.STRINGENT: (50, 50, 50),
             PrecisionMode.TARGETSCAN: (50, 50, 50),
+            PrecisionMode.TS_DENOVO: (500, 500, 500),
             PrecisionMode.CONSENSUS: (20, 20, 20),
         }[mode]
         assert_retargeting_signal(

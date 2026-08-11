@@ -21,6 +21,10 @@ TargetScan — rank >= 3 AND TargetScan *predicted* strong sites (8mer+7mer-m8
              from Predicted_Targets_Info) on the unmodified baseline. Same
              partition logic as Consensus, but does **not** require conserved-
              family tables — use when you want catalog predictions alone.
+TargetScan de novo — live TargetScanS site finding on **both** unmodified and
+             oxidized seeds (o8G encoded as T for WC search). Does **not** use
+             the TargetScan web catalog; this is true novel oxomiR prediction
+             via the offline algorithm (``o8g_ts_denovo`` / vendored Perl).
 
 Deprecated alias
 ----------------
@@ -50,37 +54,67 @@ from enum import Enum
 import pandas as pd
 
 
-class PrecisionMode(str, Enum):
+class PrecisionMode(Enum):
+    """Not a ``str`` Enum — Streamlit reloads break ``isinstance(member, str)`` paths."""
+
     SENSITIVE = "Sensitive"
     STRINGENT = "Stringent"
     TARGETSCAN = "TargetScan"
+    TS_DENOVO = "TargetScan de novo"
     CONSENSUS = "Consensus"
 
+    def __str__(self) -> str:
+        return self.value
 
-# Old UI / CSV label → current mode (HighConf was a Stringent duplicate).
+
+# Old UI / CSV label → current mode value string (HighConf was a Stringent duplicate).
 _MODE_ALIASES = {
-    "HighConf": PrecisionMode.STRINGENT,
-    "highconf": PrecisionMode.STRINGENT,
+    "HighConf": "Stringent",
+    "highconf": "Stringent",
 }
 
 
-def _coerce_mode(mode: PrecisionMode | str | object) -> PrecisionMode:
-    """Normalize to PrecisionMode; survive Streamlit module reloads (enum identity)."""
-    if isinstance(mode, PrecisionMode):
-        return mode
-    # Enum-like from a reloaded module (same name/value, different class object)
-    if hasattr(mode, "value") and not hasattr(mode, "mode"):
-        try:
-            return PrecisionMode(str(getattr(mode, "value")))
-        except Exception:
-            pass
+def mode_value(mode: object) -> str:
+    """Extract the canonical mode label string from enum / config / str.
+
+    Uses ``isinstance(..., Enum)`` (works across Streamlit-reloaded enum classes)
+    rather than ``isinstance(..., PrecisionMode)`` (fails across reloads).
+    """
+    if mode is None:
+        return PrecisionMode.SENSITIVE.value
+    # Any Enum member (including stale PrecisionMode from a prior import)
+    if isinstance(mode, Enum):
+        return str(getattr(mode, "value", mode))
     if isinstance(mode, str):
-        mode = _MODE_ALIASES.get(mode, mode)
-        return mode if isinstance(mode, PrecisionMode) else PrecisionMode(mode)
-    # Nested / mistaken PrecisionConfig passed as mode
-    if hasattr(mode, "mode"):
-        return _coerce_mode(getattr(mode, "mode"))
-    raise TypeError(f"Cannot coerce precision mode from {type(mode)!r}: {mode!r}")
+        return _MODE_ALIASES.get(mode, mode)
+    if type(mode).__name__ == "PrecisionConfig" and hasattr(mode, "mode"):
+        return mode_value(getattr(mode, "mode"))
+    if hasattr(mode, "mode") and not hasattr(mode, "value"):
+        return mode_value(getattr(mode, "mode"))
+    if hasattr(mode, "value"):
+        return str(getattr(mode, "value"))
+    # Last resort: string form often looks like "PrecisionMode.TS_DENOVO"
+    text = str(mode)
+    if "TargetScan de novo" in text:
+        return "TargetScan de novo"
+    for m in PrecisionMode:
+        if m.value in text or m.name in text:
+            return m.value
+    raise TypeError(f"Cannot read precision mode value from {type(mode)!r}: {mode!r}")
+
+
+def _coerce_mode(mode: PrecisionMode | str | object) -> PrecisionMode:
+    """Normalize to *this* module's PrecisionMode by label string only.
+
+    Never call ``PrecisionMode(x)`` — that fails across Streamlit hot-reloads when
+    a stale enum class is missing newer members (e.g. TS_DENOVO).
+    """
+    val = mode_value(mode)
+    for m in PrecisionMode:
+        if m.value == val or m.name == val:
+            return m
+    known = ", ".join(m.value for m in PrecisionMode)
+    raise ValueError(f"Unknown precision mode: {val!r}. Known: {known}")
 
 
 @dataclass(frozen=True)
@@ -91,22 +125,20 @@ class PrecisionConfig:
     @staticmethod
     def from_mode(mode: PrecisionMode | str | "PrecisionConfig", **kwargs) -> "PrecisionConfig":
         # Streamlit hot-reload can produce a *different* PrecisionConfig class object;
-        # treat duck-typed configs as already built.
-        if isinstance(mode, PrecisionConfig) or (
-            type(mode).__name__ == "PrecisionConfig" and hasattr(mode, "mode")
-        ):
-            if kwargs:
-                return PrecisionConfig(
-                    mode=_coerce_mode(getattr(mode, "mode")),
-                    use_conservation=kwargs.get(
-                        "use_conservation", getattr(mode, "use_conservation", True)
-                    ),
-                )
+        # always rebuild onto *this* module's classes.
+        if type(mode).__name__ == "PrecisionConfig" and hasattr(mode, "mode"):
             return PrecisionConfig(
                 mode=_coerce_mode(getattr(mode, "mode")),
-                use_conservation=bool(getattr(mode, "use_conservation", True)),
+                use_conservation=kwargs.get(
+                    "use_conservation",
+                    bool(getattr(mode, "use_conservation", True)),
+                ),
             )
         return PrecisionConfig(mode=_coerce_mode(mode), **kwargs)
+
+    @property
+    def mode_label(self) -> str:
+        return mode_value(self.mode)
 
     @staticmethod
     def ui_default() -> "PrecisionConfig":
@@ -146,22 +178,22 @@ def apply_precision_filter(
     out = df
     use_cons = cfg.use_conservation and env_flag("O8G_USE_CONSERVATION", True)
 
-    # Compare by *value* string — never by enum identity (Streamlit reload-safe).
-    mode_s = str(_coerce_mode(cfg.mode).value)
+    mode_s = cfg.mode_label
     if mode_s == PrecisionMode.SENSITIVE.value:
         out = out[out["site_rank"] >= 3]
     elif mode_s == PrecisionMode.STRINGENT.value:
         out = out[out["site_rank"] >= 4]
+    elif mode_s == PrecisionMode.TS_DENOVO.value:
+        if "site_rank" in out.columns:
+            out = out[out["site_rank"] >= 3]
     elif mode_s in (PrecisionMode.CONSENSUS.value, PrecisionMode.TARGETSCAN.value):
         out = out[out["site_rank"] >= 3]
         if use_cons and is_unmodified_state:
             if mode_s == PrecisionMode.CONSENSUS.value and "is_conserved" in out.columns:
                 out = out[out["is_conserved"].astype(bool)]
             elif conserved_symbols is not None:
-                # TargetScan predictions, or Consensus when is_conserved column absent
                 syms = {str(s).upper() for s in conserved_symbols}
                 out = out[out["symbol"].astype(str).str.upper().isin(syms)]
-        # oxidized: rank gate only (TargetScan has no o8G motifs)
     else:
         raise ValueError(f"Unknown precision mode: {mode_s!r}")
 
@@ -183,7 +215,10 @@ def partition_after_filter(
     rank-filtered unmodified set — so gains remain true o8G retargeting events,
     not artifacts of dropping non-conserved unmodified targets.
     """
-    mode_s = str(getattr(cfg.mode, "value", cfg.mode))
+    cfg = PrecisionConfig.from_mode(cfg)
+    mode_s = cfg.mode_label
+    # Consensus / TargetScan catalog: special gain/loss anchoring
+    # TargetScan de novo + Sensitive/Stringent: plain setdiff after filters
     if mode_s not in (PrecisionMode.CONSENSUS.value, PrecisionMode.TARGETSCAN.value):
         u = apply_precision_filter(
             unmod, cfg, conserved_symbols=conserved_symbols, is_unmodified_state=True
@@ -191,8 +226,8 @@ def partition_after_filter(
         o = apply_precision_filter(
             oxid, cfg, conserved_symbols=conserved_symbols, is_unmodified_state=False
         )
-        su = set(u["symbol"]) if len(u) else set()
-        so = set(o["symbol"]) if len(o) else set()
+        su = set(u["symbol"].astype(str).str.upper()) if len(u) else set()
+        so = set(o["symbol"].astype(str).str.upper()) if len(o) else set()
         return {
             "unmod": su,
             "oxid": so,
@@ -212,12 +247,12 @@ def partition_after_filter(
         PrecisionConfig(mode=PrecisionMode.SENSITIVE),
         is_unmodified_state=False,
     )
-    su_rank = set(u_rank["symbol"]) if len(u_rank) else set()
-    so_rank = set(o_rank["symbol"]) if len(o_rank) else set()
+    su_rank = set(u_rank["symbol"].astype(str).str.upper()) if len(u_rank) else set()
+    so_rank = set(o_rank["symbol"].astype(str).str.upper()) if len(o_rank) else set()
     u_anch = apply_precision_filter(
         unmod, cfg, conserved_symbols=conserved_symbols, is_unmodified_state=True
     )
-    su_anch = set(u_anch["symbol"]) if len(u_anch) else set()
+    su_anch = set(u_anch["symbol"].astype(str).str.upper()) if len(u_anch) else set()
     return {
         "unmod": su_anch,
         "oxid": so_rank,

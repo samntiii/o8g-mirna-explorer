@@ -24,9 +24,17 @@ import o8g_precision as _o8g_precision
 from o8g_precision import PrecisionConfig, PrecisionMode, partition_after_filter
 
 
+def _live_precision():
+    """Always use the current o8g_precision module (Streamlit hot-reload safe)."""
+    import importlib
+    import o8g_precision as _op
+
+    return importlib.reload(_op)
+
+
 def _apply_precision_filter(*args, **kwargs):
     """Call through the live module so Streamlit reloads always take effect."""
-    return _o8g_precision.apply_precision_filter(*args, **kwargs)
+    return _live_precision().apply_precision_filter(*args, **kwargs)
 
 RANK_SITE = {4: "8mer", 3: "7mer-m8", 2: "7mer-A1", 1: "6mer"}
 
@@ -311,10 +319,11 @@ class TargetDB:
         return syms
 
     def _anchor_symbols_for(self, cfg: PrecisionConfig, seed, mirna: str | None):
-        mode_s = str(getattr(cfg.mode, "value", cfg.mode))
-        if mode_s == PrecisionMode.CONSENSUS.value:
+        _op = _live_precision()
+        mode_s = _op.mode_value(cfg)
+        if mode_s == "Consensus":
             return self._conserved_for(seed, mirna)
-        if mode_s == PrecisionMode.TARGETSCAN.value:
+        if mode_s == "TargetScan":
             return self._targetscan_for(mirna)
         return None
 
@@ -329,8 +338,21 @@ class TargetDB:
         conserved_symbols: set[str] | None = None,
         mirna: str | None = None,
     ) -> pd.DataFrame:
-        # Always re-hydrate onto this module's PrecisionConfig (Streamlit reload-safe)
-        cfg = PrecisionConfig.from_mode(cfg)
+        # Always re-hydrate via the live o8g_precision module (Streamlit reload-safe)
+        _op = _live_precision()
+        cfg = _op.PrecisionConfig.from_mode(cfg)
+        mode_s = _op.mode_value(cfg)
+        if mode_s == "TargetScan de novo":
+            import o8g_ts_denovo as ts_dn
+
+            if scanner is None:
+                raise ConservationUnavailable(
+                    "TargetScan de novo needs a live UTR scanner "
+                    "(utr3_human.parquet). Open this mode once to build the index."
+                )
+            return ts_dn.targets_for_state(
+                seed, label, scanner=scanner, min_rank=3, family_id=mirna
+            )
         if conserved_symbols is None:
             conserved_symbols = self._anchor_symbols_for(cfg, seed, mirna)
         df = self.targets_enriched(
@@ -355,7 +377,20 @@ class TargetDB:
         **kwargs,
     ) -> dict[str, set[str]]:
         """Partition unmod vs oxidized after filtering both sides."""
-        cfg = PrecisionConfig.from_mode(cfg)
+        _op = _live_precision()
+        cfg = _op.PrecisionConfig.from_mode(cfg)
+        mode_s = _op.mode_value(cfg)
+        if mode_s == "TargetScan de novo":
+            import o8g_ts_denovo as ts_dn
+
+            scanner = kwargs.get("scanner")
+            if scanner is None:
+                raise ConservationUnavailable(
+                    "TargetScan de novo partition needs a live UTR scanner."
+                )
+            return ts_dn.partition_denovo(
+                seed, ox_label, scanner=scanner, min_rank=3
+            )
         mirna = kwargs.get("mirna")
         conserved_symbols = kwargs.get("conserved_symbols")
         if conserved_symbols is None:
@@ -374,7 +409,7 @@ class TargetDB:
             mature_dna=kwargs.get("mature_dna"),
             conserved_symbols=conserved_symbols,
         )
-        return partition_after_filter(
+        return _live_precision().partition_after_filter(
             unmod, oxid, cfg, conserved_symbols=conserved_symbols
         )
 

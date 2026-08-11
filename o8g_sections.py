@@ -27,6 +27,7 @@ class SectionContext:
     matched_background: set[str]
     external_refs: object
     precision_cfg: object | None = None
+    scanner: object | None = None
 
 
 def render_overlap(ctx: SectionContext) -> None:

@@ -75,13 +75,14 @@ Sidebar also has **Select gene** (typeahead → opens Gene → miRNA/oxomiR) and
 
 ### Precision modes
 
-**Sensitive** / **Stringent** / **TargetScan** / **Consensus** (sidebar).
+**Sensitive** / **Stringent** / **TargetScan** / **TargetScan de novo** / **Consensus** (sidebar).
 
 | Mode | Rule |
 |---|---|
 | **Sensitive** | Strong sites (7mer-m8 + 8mer). Discovery default. |
 | **Stringent** | 8mer only. |
 | **TargetScan** | Rank ≥ 3 ∩ TargetScanHuman 8.0 *predicted* strong sites on the unmodified baseline (`Predicted_Targets_Info`). let-7*-5p / miR-98-5p share family `let-7-5p/98-5p`. |
+| **TargetScan de novo** | Live TargetScanS site finding on WT **and** oxidized seeds (o8G→T WC encoding). Offline algorithm — not the web catalog. |
 | **Consensus** | Rank ≥ 3 ∩ TargetScan *conserved* families on the unmodified baseline. |
 
 If TargetScan/Consensus data are missing **or** the mature has no TS entry
@@ -113,7 +114,9 @@ and do **not** depend on the U proxy.
 | `o8g_engine.py` | Seed extraction, 2^k state enumeration, motifs (G·C → o8G·A) |
 | `o8g_scanner.py` | k-mer index over 3′UTRs |
 | `o8g_db.py` | Read-only SQLite accessor (+ reverse gene query) |
-| `o8g_precision.py` | Sensitive / Stringent / TargetScan / Consensus filters |
+| `o8g_precision.py` | Sensitive / Stringent / TargetScan / TargetScan de novo / Consensus |
+| `o8g_ts_denovo.py` | Offline TargetScanS de novo oxomiR site finding |
+| `third_party/targetscan/` | Vendored `targetscan_70.pl` (Bartel) |
 | `o8g_sections.py` | Section context + dispatch |
 | `o8g_venn.py`, `o8g_tf.py`, `o8g_lof.py`, `o8g_anti.py`, `o8g_energy.py` | Views / helpers |
 | `o8g_deg.py`, `o8g_deg_score.py`, `o8g_deg_upload.py` | DEG upload parse + scoring + UI |

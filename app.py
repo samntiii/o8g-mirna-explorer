@@ -28,7 +28,7 @@ _o8g_db = _importlib.reload(_o8g_db)  # pick up ConservationUnavailable across h
 from o8g_db import TargetDB, ConservationUnavailable
 from o8g_enrich import enrich, enrich_within_pool, compare_states, available_libraries
 from o8g_genes import ID_TYPES, GeneResolver
-from o8g_precision import PrecisionMode, PrecisionConfig
+from o8g_precision import PrecisionMode, PrecisionConfig, mode_value
 from o8g_thermo import METRIC_CAPTION, vienna_available
 from o8g_pubthermo import annotate_gene_mirna_hits, PROVENANCE_CAPTION as PUBTHERMO_CAPTION
 import o8g_refsets as refsets
@@ -52,7 +52,7 @@ RANK_LABEL = {1: "6mer", 2: "7mer-A1", 3: "7mer-m8", 4: "8mer"}
 
 # Bump when TargetDB / GeneResolver constructor API changes so Streamlit
 # drops stale @cache_resource instances across hot-reloads.
-_CACHE_VER = 19
+_CACHE_VER = 23
 
 
 @st.cache_resource
@@ -326,25 +326,26 @@ with st.sidebar.expander("OBOE oxo-G prior", expanded=False):
 lib = st.sidebar.selectbox("Pathway library", available_libraries(), index=0)
 
 st.sidebar.markdown("### Precision mode")
-_MODE_OPTIONS = [m.value for m in PrecisionMode]  # Sensitive / Stringent / TargetScan / Consensus
+_MODE_OPTIONS = [m.value for m in PrecisionMode]
 mode_name = st.sidebar.radio(
     "Target-list filter",
     _MODE_OPTIONS,
     index=0,  # Sensitive — discovery default
     key=f"precision_mode_v{_CACHE_VER}",
     help=(
-        "Sensitive: 7mer-m8+8mer. Stringent: 8mer only. "
-        "TargetScan: + TargetScan *predicted* strong sites on unmodified baseline "
-        "(Predicted_Targets_Info — no conserved-family file required). "
-        "Consensus: + TargetScan *conserved* families (needs Conserved_Family_Info). "
-        "Filters apply to each oxidation state before gained/lost."
+        "Sensitive: 7mer-m8+8mer (explorer DB). Stringent: 8mer only. "
+        "TargetScan: explorer ∩ catalog WT predictions. "
+        "TargetScan de novo: live TargetScanS site finding on oxidized seeds "
+        "(o8G→T WC encoding; not the web catalog). "
+        "Consensus: explorer ∩ TargetScan conserved WT families."
     ),
 )
-precision_cfg = PrecisionConfig.from_mode(mode_name)
-effective_mode = mode_name
+precision_cfg = PrecisionConfig.from_mode(str(mode_name))
+effective_mode = str(mode_name)
 st.sidebar.caption(
-    "Paper / claims: use **Stringent** or **Consensus**. "
-    "**TargetScan** = catalog predictions alone (not conservation). "
+    "Paper / claims: **Stringent** or **Consensus**. "
+    "**TargetScan** = catalog WT anchor. "
+    "**TargetScan de novo** = novel oxomiR sites via offline TargetScan algorithm. "
     "Gained/lost are always computed after filtering both states."
 )
 
@@ -391,14 +392,32 @@ elif mode_name == "TargetScan":
 
 universe = _utr_universe()
 
+# TargetScan de novo needs the live UTR index (built once, cached).
+_denovo_scanner = None
+if mode_name == "TargetScan de novo":
+    with st.spinner("Building TargetScan de novo UTR index (one-time)…"):
+        try:
+            _denovo_scanner = get_scanner()
+            st.sidebar.caption(
+                "De novo backend: TargetScanS site types on human 3′UTRs "
+                "(o8G encoded as T for WC search). Optional Perl: "
+                "`O8G_TS_DENOVO_BACKEND=perl`."
+            )
+        except Exception as _e:
+            precision_cfg = PrecisionConfig.from_mode("Sensitive")
+            effective_mode = "Sensitive (de novo scanner unavailable)"
+            st.sidebar.error("TargetScan de novo unavailable — showing Sensitive. " + str(_e))
+
 
 def filtered_targets(label, **kw):
     """Single entry point so no call site bypasses the precision ladder."""
     global precision_cfg, effective_mode
+    if kw.get("scanner") is None and _denovo_scanner is not None:
+        kw = {**kw, "scanner": _denovo_scanner}
     try:
         return db.targets_filtered(seed, label, precision_cfg, mirna=mirna, **kw)
     except ConservationUnavailable as e:
-        # Defensive: never crash a view if TS/Consensus anchor is empty mid-render
+        # Defensive: never crash a view if TS/Consensus/de novo anchor is empty mid-render
         precision_cfg = PrecisionConfig.from_mode("Sensitive")
         effective_mode = "Sensitive (anchor unavailable)"
         st.sidebar.error("Precision anchor unavailable — showing Sensitive. " + str(e))
@@ -566,8 +585,8 @@ elif _SECTION == "Compare two states":
         tA = filtered_targets(sA, scanner=None, mature_dna=info["seq_dna"])
         tB = filtered_targets(sB, scanner=None, mature_dna=info["seq_dna"])
         if "site_rank" in tA.columns:
-            tA = tA[tA["site_rank"] >= max(min_rank, 3 if precision_cfg.mode != PrecisionMode.STRINGENT else 4)]
-            tB = tB[tB["site_rank"] >= max(min_rank, 3 if precision_cfg.mode != PrecisionMode.STRINGENT else 4)]
+            tA = tA[tA["site_rank"] >= max(min_rank, 3 if mode_value(precision_cfg) != "Stringent" else 4)]
+            tB = tB[tB["site_rank"] >= max(min_rank, 3 if mode_value(precision_cfg) != "Stringent" else 4)]
         gA = tA["symbol"].tolist()
         gB = tB["symbol"].tolist()
         sa, sb = set(gA), set(gB)
@@ -732,7 +751,7 @@ elif _SECTION == "All states":
         def _strong_set_all(label: str) -> set[str]:
             df = filtered_targets(label, scanner=None, mature_dna=info["seq_dna"])
             if "site_rank" in df.columns:
-                floor = 4 if str(getattr(precision_cfg.mode, "value", precision_cfg.mode)) == "Stringent" else max(min_rank, 3)
+                floor = 4 if mode_value(precision_cfg) == "Stringent" else max(min_rank, 3)
                 df = df[df["site_rank"] >= floor]
             return set(df["symbol"].astype(str))
 
@@ -750,6 +769,7 @@ elif _SECTION == "All states":
             matched_background=universe,
             external_refs=refsets,
             precision_cfg=precision_cfg,
+            scanner=_denovo_scanner,
         )
         from o8g_lof import render_state_summary as _render_lof_summary
 
@@ -822,7 +842,7 @@ elif _SECTION in _SECTION_DISPATCH:
     def _strong_set(label: str) -> set[str]:
         df = filtered_targets(label, scanner=None, mature_dna=info["seq_dna"])
         if "site_rank" in df.columns:
-            floor = 4 if precision_cfg.mode == PrecisionMode.STRINGENT else max(min_rank, 3)
+            floor = 4 if mode_value(precision_cfg) == "Stringent" else max(min_rank, 3)
             df = df[df["site_rank"] >= floor]
         return set(df["symbol"].astype(str))
 
@@ -840,6 +860,7 @@ elif _SECTION in _SECTION_DISPATCH:
         matched_background=universe,
         external_refs=refsets,
         precision_cfg=precision_cfg,
+        scanner=_denovo_scanner,
     )
     getattr(sections, _SECTION_DISPATCH[_SECTION])(ctx)
 
@@ -1129,16 +1150,20 @@ elif _SECTION == "External DB comparison":
         "Compare **any Explorer oxidation state** (unmodified or o8G) to open external "
         "resources. External DBs only catalog **unmodified** miRNAs — useful for asking "
         "which oxomiR targets are novel vs already known wild-type targets. "
-        "Predicted: TargetScan 8 / miRDB≥80 / DIANA-microT≥0.7 / miRmap top-quintile. "
-        "Experimental: ENCORI CLIP (API) and miRTarBase strong evidence (if a local "
-        "`paper/data/mirtarbase/hsa_MTI*` file is present)."
+        "**Explorer** always follows the sidebar precision mode "
+        f"(currently `{effective_mode}`). "
+        "Optional **TargetScan de novo** is a live TargetScanS rescan of that same "
+        "oxidation state (independent of the sidebar mode). "
+        "Predicted catalogs: TargetScan 8 / miRDB≥80 / DIANA-microT≥0.7 / miRmap. "
+        "Experimental: ENCORI CLIP; miRTarBase if a local file is present."
     )
     db_state = st.selectbox(
         "Explorer oxidation state",
         state_labels,
         index=0,
         key="ext_db_explorer_state",
-        help="External databases stay on the unmodified mature miRNA; only Explorer changes with o8G.",
+        help="External catalogs stay on the unmodified mature; Explorer and optional "
+             "TargetScan de novo follow this oxidation state.",
     )
     st.markdown(
         seed_html(
@@ -1153,6 +1178,14 @@ elif _SECTION == "External DB comparison":
         help="When comparing an oxidized state, keep the wild-type Explorer list in the UpSet "
              "so gained/lost vs external DBs is visible.",
     )
+    include_ts_denovo = st.checkbox(
+        "Also include TargetScan de novo for this oxidation state",
+        value=False,
+        key="ext_db_ts_denovo",
+        help="Live TargetScanS site finding on the selected ox state (o8G→T WC encoding). "
+             "Lets you contrast catalog TargetScan (WT only) vs algorithm de novo (ox-aware) "
+             "even when the sidebar precision mode is Sensitive/Stringent.",
+    )
     avail = refsets.available_tools()
     default_tools = [t for t, ok in avail.items() if ok and t != "miRTarBase"]
     if avail.get("miRTarBase"):
@@ -1162,11 +1195,14 @@ elif _SECTION == "External DB comparison":
         "Databases to compare",
         tool_opts,
         default=["Explorer"] + default_tools[:4],
-        help="Explorer uses the sidebar precision mode on the oxidation state selected above.",
+        help=(
+            f"Explorer uses sidebar precision mode `{effective_mode}` on the oxidation "
+            "state selected above. Catalog TargetScan is always unmodified WT."
+        ),
     )
     n_est = len(chosen) + (
         1 if include_unmod_explorer and db_state != "none" and "Explorer" in chosen else 0
-    )
+    ) + (1 if include_ts_denovo else 0)
     # Streamlit raises when min_value == max_value; two selected sets → fixed min_dbs=2.
     if n_est > 2:
         min_dbs = st.slider(
@@ -1180,8 +1216,12 @@ elif _SECTION == "External DB comparison":
         min_dbs = 2
         st.caption("Master list requires agreement of both selected databases.")
 
-    if len(chosen) < 2 and not (include_unmod_explorer and "Explorer" in chosen):
-        st.info("Select at least two databases (or Explorer + unmodified Explorer).")
+    if len(chosen) < 2 and not (
+        (include_unmod_explorer and "Explorer" in chosen) or include_ts_denovo
+    ):
+        st.info(
+            "Select at least two databases (or Explorer + unmodified / TargetScan de novo)."
+        )
     else:
         with st.spinner(f"Loading reference sets for {mirna} [{db_state}]…"):
             sets: dict[str, set] = {}
@@ -1201,6 +1241,19 @@ elif _SECTION == "External DB comparison":
             if include_unmod_explorer and db_state != "none":
                 ours_unmod = _load_explorer("none")
                 sets["Explorer (none)"] = set(ours_unmod["symbol"])
+            if include_ts_denovo:
+                try:
+                    import o8g_ts_denovo as _ts_dn
+
+                    _sc = _denovo_scanner if _denovo_scanner is not None else get_scanner()
+                    _dn = _ts_dn.targets_for_state(
+                        seed, db_state, scanner=_sc, min_rank=max(min_rank, 3), family_id=mirna
+                    )
+                    sets[f"TargetScan de novo ({db_state})"] = (
+                        set(_dn["symbol"].astype(str)) if len(_dn) else set()
+                    )
+                except Exception as _e:
+                    st.warning(f"TargetScan de novo set unavailable: {_e}")
             ext = refsets.load_selected(mirna, [t for t in chosen if t != "Explorer"])
             sets.update(ext)
 
@@ -1216,9 +1269,11 @@ elif _SECTION == "External DB comparison":
                 base = name.split(" (")[0]
                 meta = refsets.TOOL_META.get(base, {})
                 if name.startswith("Explorer (") and name != "Explorer (none)":
-                    ox_note = "yes — follows oxidation state selector"
+                    ox_note = f"yes — Explorer under precision `{effective_mode}`"
                 elif name == "Explorer (none)":
                     ox_note = "fixed — Explorer unmodified (`none`)"
+                elif name.startswith("TargetScan de novo"):
+                    ox_note = "yes — live TargetScanS on this ox state (not the catalog)"
                 else:
                     ox_note = "no — unmodified miRNA catalog (same for every o8G state)"
                 size_rows.append(
@@ -1231,9 +1286,9 @@ elif _SECTION == "External DB comparison":
                 )
             st.markdown("#### Set sizes")
             st.caption(
-                "Only **Explorer (o8G…)** changes when you switch oxidation state. "
-                "TargetScan / miRDB / DIANA / miRmap / ENCORI counts stay fixed for this miRNA. "
-                "The UpSet bars and master list *do* change, because intersections with Explorer change."
+                "Only **Explorer (o8G…)** and **TargetScan de novo** change with oxidation. "
+                "Catalog TargetScan / miRDB / DIANA / miRmap / ENCORI stay fixed for this miRNA. "
+                "UpSet bars and the master list change because intersections with Explorer change."
             )
             st.dataframe(pd.DataFrame(size_rows), hide_index=True, width="stretch")
 
@@ -1412,5 +1467,7 @@ st.caption("Prediction: seed positions 2–8; unoxidized G pairs C, 8-oxoG (o8G)
            "not absolute significance, and validate candidates experimentally. "
            "Gene ID resolution uses a locally cached NCBI/HGNC map (no runtime API). "
            "External DB comparison uses local TargetScan/miRDB/DIANA/miRmap files when present "
-           "plus the ENCORI open API; an optional lost-gene list ranks Explorer losses by "
-           "external WT support. Target tables are ranked by site type (8mer > 7mer-m8 > …).")
+           "plus the ENCORI open API; optional **TargetScan de novo** adds a live ox-aware "
+           "TargetScanS set. Explorer follows the sidebar precision mode. An optional lost-gene "
+           "list ranks Explorer losses by external WT support. Target tables are ranked by "
+           "site type (8mer > 7mer-m8 > …).")

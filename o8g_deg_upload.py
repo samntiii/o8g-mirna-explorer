@@ -201,6 +201,7 @@ def render(ctx: SectionContext) -> None:
             single_g_only=single_g,
             max_states=32,
             down_weight=float(down_w),
+            scanner=getattr(ctx, "scanner", None),
         )
 
     if ranked.empty:
