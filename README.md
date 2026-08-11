@@ -41,11 +41,13 @@ is required.
 | `genesets/` | Pathway + TF enrichment (Enrichr GMTs) |
 | `gene_aliases.parquet` + `o8g_reverse.db` | Gene → miRNA/oxomiR (+ sidebar gene jump) |
 | `mirdb_ref.parquet` | Optional miRDB attrition column in **All states**; `python scripts/build_mirdb_ref.py` |
-| `utr3_human.parquet` | Optional live UTR rescans / ViennaRNA windows |
-| `paper/data/Predicted_Targets_Info.default_predictions.txt` | **TargetScan** precision mode |
+| `utr3_human.parquet` | **TargetScan de novo** precision mode; optional live UTR rescans / ViennaRNA windows |
+| `paper/data/Predicted_Targets_Info.default_predictions.txt` | **TargetScan** precision mode (WT catalog anchor) |
 | `paper/data/Conserved_Family_Info.txt` | **Consensus** precision mode |
 | `paper/data/Conserved_Site_Context_Scores.txt` | TargetScan context++ columns |
+| `models/oboe_rnabert/checkpoint/` | OBOE RNABERT oxo-G prior (optional; GC fallback without it) |
 | ViennaRNA (Python `ViennaRNA`) | Opt-in energetics / antagomir ΔG |
+| `pip install -r requirements-oboe.txt` | Optional torch stack for OBOE RNABERT inference |
 
 Fetch extra TF motif libraries (if missing):
 
@@ -68,22 +70,31 @@ only the active section runs on each rerun.
 | **Antagomir design** | Oxo-selective oligo discrimination (G→U proxy); ranks single-G states; explains weak full-length folds | ViennaRNA optional |
 | **RNA-seq / DEG upload** | Exploratory UP↔lost / DOWN↔gained concordance for a miRNA panel (CSV/TSV/XLSX; multi-sheet Excel picker) | session upload only |
 | **Gene → miRNA/oxomiR** | Reverse lookup (symbol / Ensembl / Entrez); also reachable from sidebar **Select gene** | `gene_aliases.parquet`, `o8g_reverse.db` |
-| **External DB comparison** | Explorer vs TargetScan / miRDB / DIANA / miRmap / ENCORI / miRTarBase (WT catalogs) | local ref files |
+| **External DB comparison** | Explorer (sidebar precision mode) vs WT catalogs (TargetScan / miRDB / DIANA / miRmap / ENCORI / miRTarBase); optional **TargetScan de novo** set for the selected ox state | local ref files; `utr3_human.parquet` for de novo |
 
 Sidebar also has **Select gene** (typeahead → opens Gene → miRNA/oxomiR) and an
-**OBOE oxo-G prior** — local fine-tuned RNABERT (Xia et al. Figshare data; test AUC ~0.98) ranks which seed Gs / ox states are sequence-plausible; GC motif fallback if the checkpoint is missing.
+**OBOE oxo-G prior** — local fine-tuned RNABERT (Xia et al. Figshare data; held-out
+test AUC ~0.98) ranks which seed Gs / ox states are sequence-plausible; GC motif
+fallback if the checkpoint or torch stack is missing.
 
 ### Precision modes
 
 **Sensitive** / **Stringent** / **TargetScan** / **TargetScan de novo** / **Consensus** (sidebar).
+All of these apply to Explorer target lists used across every view (including
+External DB’s Explorer arm, DEG concordance, overlap, etc.).
 
 | Mode | Rule |
 |---|---|
-| **Sensitive** | Strong sites (7mer-m8 + 8mer). Discovery default. |
+| **Sensitive** | Strong sites (7mer-m8 + 8mer) from the explorer DB. Discovery default. |
 | **Stringent** | 8mer only. |
-| **TargetScan** | Rank ≥ 3 ∩ TargetScanHuman 8.0 *predicted* strong sites on the unmodified baseline (`Predicted_Targets_Info`). let-7*-5p / miR-98-5p share family `let-7-5p/98-5p`. |
-| **TargetScan de novo** | Live TargetScanS site finding on WT **and** oxidized seeds (o8G→T WC encoding). Offline algorithm — not the web catalog. |
+| **TargetScan** | Rank ≥ 3 ∩ TargetScanHuman 8.0 *predicted* strong sites on the **unmodified** baseline (`Predicted_Targets_Info`). Catalog lookup — not oxomiR de novo. let-7*-5p / miR-98-5p → family `let-7-5p/98-5p`. |
+| **TargetScan de novo** | Live TargetScanS site finding on **both** WT and oxidized seeds (o8G encoded as **T** for WC search so sites require **A**). Uses `TargetScanner` / vendored `third_party/targetscan/targetscan_70.pl`; **not** the web catalog. Requires `utr3_human.parquet`. |
 | **Consensus** | Rank ≥ 3 ∩ TargetScan *conserved* families on the unmodified baseline. |
+
+**Sensitive vs TargetScan de novo.** Same TargetScanS site rules on the same
+3′UTRs, so gene counts usually **match** for a given ox state. Prefer de novo
+when you need a live/ox-aware algorithm path or to contrast **catalog TargetScan
+(WT file)** vs **algorithm de novo** in External DB comparison.
 
 If TargetScan/Consensus data are missing **or** the mature has no TS entry
 (e.g. some poorly annotated miRNAs), the app **refuses an empty baseline** and
@@ -172,6 +183,7 @@ assert not (mir1["state_label"] == "o8G@7").any()
 ```python
 from o8g_db import TargetDB
 from o8g_precision import PrecisionConfig
+from o8g_scanner import TargetScanner
 
 db = TargetDB("o8g_targets.db")
 info = db.mirna_info("hsa-miR-1-3p")
@@ -179,6 +191,16 @@ parts = db.retarget_partition(
     info["seed"], "o8G@7", PrecisionConfig.from_mode("Sensitive"), mirna=info["mirna"]
 )
 print({k: len(v) for k, v in parts.items()})  # unmod / oxid / lost / gained / shared
+
+# TargetScan de novo (live UTR scan; needs utr3_human.parquet)
+scanner = TargetScanner.from_parquet("utr3_human.parquet")
+parts_dn = db.retarget_partition(
+    info["seed"],
+    "o8G@7",
+    PrecisionConfig.from_mode("TargetScan de novo"),
+    mirna=info["mirna"],
+    scanner=scanner,
+)
 
 # reverse: which oxomiR states target HDAC4?
 from o8g_genes import GeneResolver
@@ -193,11 +215,16 @@ hits = db.states_targeting_gene(g.gene_idx)
 - Reverse lookup uses the same strong-site (7mer-m8 + 8mer) precomputed DB —
   not live TargetScan/miRDB consensus.
 - External databases catalog **unmodified** mature miRNAs only; only Explorer
-  changes with o8G state.
-- **TargetScan / Consensus** need TS8 files and a mature that TS actually
-  annotates; otherwise the UI falls back to Sensitive.
+  (and optional TargetScan de novo) change with o8G state.
+- **TargetScan** (catalog) / **Consensus** need TS8 files and a mature that TS
+  actually annotates; otherwise the UI falls back to Sensitive.
+- **TargetScan de novo** needs `utr3_human.parquet`; first UI selection builds
+  the UTR index once (~30–40s). Optional Perl backend:
+  `O8G_TS_DENOVO_BACKEND=perl`.
 - Oxidized-state ViennaRNA ΔG uses a **G→U proxy**. Prefer site type and
   gold/null benchmarks for claims; use duplex numbers exploratorily.
+- OBOE scores are **site-likelihood priors** for ranking ox states, not causal
+  LoF calls (window-classifier AUC ≠ per-seed-G ranking accuracy).
 - DEG upload is an **exploratory live-site** concordance module (session-only
   uploads); not a DESeq2 pipeline and not a primary Database Issue claim.
 
