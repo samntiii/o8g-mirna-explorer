@@ -70,35 +70,40 @@ only the active section runs on each rerun.
 | **Antagomir design** | Oxo-selective oligo discrimination (G→U proxy); ranks single-G states; explains weak full-length folds | ViennaRNA optional |
 | **RNA-seq / DEG upload** | Exploratory UP↔lost / DOWN↔gained concordance for a miRNA panel (CSV/TSV/XLSX; multi-sheet Excel picker) | session upload only |
 | **Gene → miRNA/oxomiR** | Reverse lookup (symbol / Ensembl / Entrez); also reachable from sidebar **Select gene** | `gene_aliases.parquet`, `o8g_reverse.db` |
-| **External DB comparison** | Explorer (sidebar precision mode) vs WT catalogs (TargetScan / miRDB / DIANA / miRmap / ENCORI / miRTarBase); optional **TargetScan de novo** set for the selected ox state | local ref files; `utr3_human.parquet` for de novo |
+| **External DB comparison** | Explorer (sidebar prediction mode) vs WT catalogs (TargetScan / miRDB / DIANA / miRmap / ENCORI / miRTarBase); optional **TargetScan de novo** set for the selected ox state | local ref files; `utr3_human.parquet` for de novo |
 
 Sidebar also has **Select gene** (typeahead → opens Gene → miRNA/oxomiR) and an
 **OBOE oxo-G prior** — local fine-tuned RNABERT (Xia et al. Figshare data; held-out
 test AUC ~0.98) ranks which seed Gs / ox states are sequence-plausible; GC motif
 fallback if the checkpoint or torch stack is missing.
 
-### Precision modes
+### Prediction modes
 
-**Sensitive** / **Stringent** / **TargetScan** / **TargetScan de novo** / **Consensus** (sidebar).
-All of these apply to Explorer target lists used across every view (including
-External DB’s Explorer arm, DEG concordance, overlap, etc.).
+**Sequence-based (low stringency)** / **Sequence-based (high stringency)** /
+**TargetScan** / **TargetScan de novo** / **Consensus** (sidebar; UI label
+**Prediction mode**). Legacy labels `Sensitive` / `Stringent` still resolve in
+code. All of these apply to Explorer target lists used across every view
+(including External DB’s Explorer arm, DEG concordance, overlap, etc.).
 
 | Mode | Rule |
 |---|---|
-| **Sensitive** | Strong sites (7mer-m8 + 8mer) from the explorer DB. Discovery default. |
-| **Stringent** | 8mer only. |
-| **TargetScan** | Rank ≥ 3 ∩ TargetScanHuman 8.0 *predicted* strong sites on the **unmodified** baseline (`Predicted_Targets_Info`). Catalog lookup — not oxomiR de novo. let-7*-5p / miR-98-5p → family `let-7-5p/98-5p`. |
+| **Sequence-based (low stringency)** | Strong sites (7mer-m8 + 8mer) from the explorer DB. Discovery default. Formerly Sensitive. |
+| **Sequence-based (high stringency)** | 8mer only. Formerly Stringent. |
+| **TargetScan** | Rank ≥ 3 ∩ TargetScanHuman 8.0 *predicted* strong sites on the **unmodified** baseline (`Predicted_Targets_Info`). Catalog lookup — WT anchor for lost/gained; oxidized *display* lists stay rank≥3. let-7*-5p / miR-98-5p → family `let-7-5p/98-5p`. |
 | **TargetScan de novo** | Live TargetScanS site finding on **both** WT and oxidized seeds (o8G encoded as **T** for WC search so sites require **A**). Uses `TargetScanner` / vendored `third_party/targetscan/targetscan_70.pl`; **not** the web catalog. Requires `utr3_human.parquet`. |
 | **Consensus** | Rank ≥ 3 ∩ TargetScan *conserved* families on the unmodified baseline. |
 
-**Sensitive vs TargetScan de novo.** Same TargetScanS site rules on the same
-3′UTRs, so gene counts usually **match** for a given ox state. Prefer de novo
-when you need a live/ox-aware algorithm path or to contrast **catalog TargetScan
-(WT file)** vs **algorithm de novo** in External DB comparison.
+**Catalog TargetScan vs TargetScan de novo.** On an **oxidized** state, gene
+counts often **match** because catalog mode only intersects the *unmodified*
+baseline for lost/gained; the oxidized arm is still rank≥3 — the same site types
+de novo uses. That is **not a bug**. Prefer External DB: catalog WT TargetScan
+vs de novo ox for a true algorithm contrast. Low-stringency sequence-based vs
+de novo also usually match (same TargetScanS rules on the same 3′UTRs).
 
 If TargetScan/Consensus data are missing **or** the mature has no TS entry
 (e.g. some poorly annotated miRNAs), the app **refuses an empty baseline** and
-falls back to Sensitive — it does not silently claim “everything is gained.”
+falls back to sequence-based (low stringency) — it does not silently claim
+“everything is gained.”
 
 Filters always apply to each oxidation state **before** gained/lost.
 
@@ -125,7 +130,7 @@ and do **not** depend on the U proxy.
 | `o8g_engine.py` | Seed extraction, 2^k state enumeration, motifs (G·C → o8G·A) |
 | `o8g_scanner.py` | k-mer index over 3′UTRs |
 | `o8g_db.py` | Read-only SQLite accessor (+ reverse gene query) |
-| `o8g_precision.py` | Sensitive / Stringent / TargetScan / TargetScan de novo / Consensus |
+| `o8g_precision.py` | Prediction modes: sequence-based low/high / TargetScan / de novo / Consensus |
 | `o8g_ts_denovo.py` | Offline TargetScanS de novo oxomiR site finding |
 | `third_party/targetscan/` | Vendored `targetscan_70.pl` (Bartel) |
 | `o8g_sections.py` | Section context + dispatch |
@@ -188,7 +193,7 @@ from o8g_scanner import TargetScanner
 db = TargetDB("o8g_targets.db")
 info = db.mirna_info("hsa-miR-1-3p")
 parts = db.retarget_partition(
-    info["seed"], "o8G@7", PrecisionConfig.from_mode("Sensitive"), mirna=info["mirna"]
+    info["seed"], "o8G@7", PrecisionConfig.from_mode("Sequence-based (low stringency)"), mirna=info["mirna"]
 )
 print({k: len(v) for k, v in parts.items()})  # unmod / oxid / lost / gained / shared
 
@@ -217,7 +222,7 @@ hits = db.states_targeting_gene(g.gene_idx)
 - External databases catalog **unmodified** mature miRNAs only; only Explorer
   (and optional TargetScan de novo) change with o8G state.
 - **TargetScan** (catalog) / **Consensus** need TS8 files and a mature that TS
-  actually annotates; otherwise the UI falls back to Sensitive.
+  actually annotates; otherwise the UI falls back to sequence-based (low stringency).
 - **TargetScan de novo** needs `utr3_human.parquet`; first UI selection builds
   the UTR index once (~30–40s). Optional Perl backend:
   `O8G_TS_DENOVO_BACKEND=perl`.

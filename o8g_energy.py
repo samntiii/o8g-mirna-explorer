@@ -91,6 +91,71 @@ def _fold_from_ddg(ddG: float) -> float:
     return float(math.exp(-ddG / 0.616))
 
 
+def reverse_complement_dna(seq: str) -> str:
+    s = clean_seq(seq)
+    table = str.maketrans("ACGT", "TGCA")
+    return s.translate(table)[::-1]
+
+
+def collateral_mrna_offtargets(
+    oligo_dna: str,
+    scanner,
+    *,
+    min_match: int = 10,
+    top_n: int = 80,
+) -> "pd.DataFrame":
+    """Predict mRNA 3′UTR off-targets for an antagomir (hybridization, not AGO).
+
+    The oligo binds RNA stretches complementary to itself. Those sites are the
+    reverse-complement of the oligo (≈ mature for a full RC). We report genes
+    whose 3′UTR contains a contiguous match of length ≥ ``min_match``.
+    """
+    import pandas as pd
+
+    if scanner is None or not getattr(scanner, "utrs", None):
+        return pd.DataFrame(columns=["symbol", "gene_id", "match_nt", "site_in_utr"])
+
+    oligo = clean_seq(oligo_dna)
+    if len(oligo) < min_match:
+        return pd.DataFrame(columns=["symbol", "gene_id", "match_nt", "site_in_utr"])
+
+    # Sequence the oligo hybridizes to in an mRNA (DNA alphabet)
+    site = reverse_complement_dna(oligo)
+    kmers = {site[i : i + min_match] for i in range(len(site) - min_match + 1)}
+    hits: list[dict] = []
+    symbols = scanner.symbols
+    genes = scanner.genes
+    for i, utr in enumerate(scanner.utrs):
+        if not any(k in utr for k in kmers):
+            continue
+        best = 0
+        best_site = ""
+        for L in range(len(site), min_match - 1, -1):
+            for j in range(len(site) - L + 1):
+                win = site[j : j + L]
+                if win in utr:
+                    best = L
+                    best_site = win
+                    break
+            if best:
+                break
+        if best >= min_match:
+            hits.append(
+                {
+                    "symbol": str(symbols[i]),
+                    "gene_id": str(genes[i]),
+                    "match_nt": int(best),
+                    "site_in_utr": best_site,
+                }
+            )
+    if not hits:
+        return pd.DataFrame(columns=["symbol", "gene_id", "match_nt", "site_in_utr"])
+    out = pd.DataFrame(hits).sort_values(
+        ["match_nt", "symbol"], ascending=[False, True]
+    )
+    return out.head(top_n).reset_index(drop=True)
+
+
 def design_antagomir(
     mature_dna: str,
     oxidized_positions: tuple[int, ...],

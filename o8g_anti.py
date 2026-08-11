@@ -1,4 +1,4 @@
-"""Antagomir design view — state discrimination, not AGO-loaded seed targeting."""
+"""Antagomir design view — state discrimination + mRNA collateral hybridization."""
 from __future__ import annotations
 
 import importlib
@@ -10,6 +10,7 @@ import o8g_energy as _o8g_energy
 
 _o8g_energy = importlib.reload(_o8g_energy)
 from o8g_energy import (  # noqa: E402  — reload-first for Streamlit hot-reload
+    collateral_mrna_offtargets,
     design_antagomir,
     feasibility_label,
     position2_warning,
@@ -27,11 +28,12 @@ def render(ctx: SectionContext) -> None:
     )
     st.info(
         "An antagomir **is not AGO-loaded and has no seed**. This view scores "
-        "**state discrimination** only — never an mRNA target list from the oligo.\n\n"
-        "**Why scores often look weak:** a full-length reverse-complement only changes "
-        "the base(s) opposite oxidized G(s). With 1–3 of ~22 nt differing, |ΔΔG| stays "
-        "small and fold-preference near 1× **by construction**. We therefore score an "
-        "**oxo-selective** oligo (A opposite oxidized G, not C)."
+        "**state discrimination** (oxo-selective oligo vs mature) and separately "
+        "lists **mRNA 3′UTR hybridization off-targets** (collateral).\n\n"
+        "**Why WT-selective is omitted:** a full-length reverse-complement only "
+        "changes the base(s) opposite oxidized G(s). With 1–3 of ~22 nt differing, "
+        "|ΔΔG| stays small and fold-preference near 1× **by construction**, so the "
+        "UI always designs an **oxo-selective** oligo (A opposite oxidized G)."
     )
 
     ox_labs = [s for s in ctx.state_labels if s != "none"] or list(ctx.state_labels)
@@ -59,18 +61,12 @@ def render(ctx: SectionContext) -> None:
             "screens (weak fold preference vs interior Gs). Prefer an interior o8G state."
         )
 
-    kind = st.radio(
-        "Oligo chemistry",
-        ["oxo-selective (A opposite o8G)", "wt-selective (standard RC)"],
-        horizontal=True,
-        key="anti_kind",
-        help="Oxo-selective puts A opposite oxidized G so the oligo prefers the oxidized mature.",
-    )
     design = design_antagomir(
         ctx.info.get("seq_dna", ""),
         positions,
-        kind="wt-selective" if kind.startswith("wt") else "oxo-selective",
+        kind="oxo-selective",
     )
+    st.caption("Chemistry: **oxo-selective** (A opposite o8G; C opposite other Gs).")
     st.code(design.sequence)
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("dG_normal", f"{design.dG_normal:.2f}" if design.dG_normal is not None else "—")
@@ -119,36 +115,42 @@ def render(ctx: SectionContext) -> None:
                 "discriminators — use for ranking states, not as a Kd claim."
             )
 
-    # Collateral: other miRNAs sharing the reverse-complement 7mer seed window
-    st.markdown("##### Collateral mature scan (sequence identity, not target prediction)")
+    st.markdown("##### Collateral mRNA off-targets (3′UTR hybridization)")
+    st.caption(
+        "Genes whose 3′UTR contains a long contiguous stretch complementary to the "
+        "antagomir (sequence the oligo can bind). This is **mRNA off-target risk**, "
+        "not a scan of other miRNAs."
+    )
+    min_match = st.slider(
+        "Minimum contiguous match (nt)",
+        min_value=8,
+        max_value=16,
+        value=10,
+        key="anti_collateral_k",
+    )
+    scanner = ctx.scanner
+    if scanner is None:
+        st.caption(
+            "UTR scanner unavailable (`utr3_human.parquet`). Cannot predict mRNA off-targets."
+        )
+        return
     try:
-        mir_df = ctx.db.mirnas() if hasattr(ctx.db, "mirnas") else None
-        if mir_df is not None and len(mir_df):
-            oligo = design.sequence
-            hits = []
-            for _, row in mir_df.iterrows():
-                seq = str(row.get("seq_dna", "")).upper()
-                if not seq or row["mirna"] == ctx.mirna:
-                    continue
-                best = 0
-                for i in range(max(1, len(oligo) - 6)):
-                    win = oligo[i : i + 7]
-                    if win and win in seq:
-                        best = max(best, 7)
-                if best >= 7:
-                    hits.append(
-                        {"mirna": row["mirna"], "seed": row.get("seed", ""), "match_nt": best}
-                    )
-            hit_df = (
-                pd.DataFrame(hits).sort_values("match_nt", ascending=False)
-                if hits
-                else pd.DataFrame()
+        with st.spinner("Scanning 3′UTRs for oligo hybridization sites…"):
+            hit_df = collateral_mrna_offtargets(
+                design.sequence, scanner, min_match=int(min_match), top_n=80
             )
-            st.dataframe(hit_df.head(30) if len(hit_df) else hit_df, hide_index=True)
-            st.caption(
-                f"{len(hit_df)} other matures with a full 7-nt oligo window match (collateral risk)."
+        st.dataframe(hit_df, hide_index=True, width="stretch")
+        st.caption(
+            f"{len(hit_df)} genes with ≥{min_match}-nt contiguous match "
+            "(showing top 80 by match length)."
+        )
+        if len(hit_df):
+            st.download_button(
+                "⬇ Download mRNA collateral hits (CSV)",
+                hit_df.to_csv(index=False),
+                file_name=f"{ctx.mirna}_antagomir_mrna_offtargets.csv",
+                mime="text/csv",
+                key="anti_collateral_dl",
             )
-        else:
-            st.caption("miRNA table unavailable for collateral scan.")
     except Exception as e:
-        st.caption(f"Collateral scan skipped ({type(e).__name__}: {e}).")
+        st.caption(f"Collateral mRNA scan skipped ({type(e).__name__}: {e}).")

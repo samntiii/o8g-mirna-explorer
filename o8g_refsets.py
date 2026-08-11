@@ -113,7 +113,7 @@ TOOL_META = {
     "Explorer": {
         "kind": "predicted",
         "version": "o8G seed engine (this app)",
-        "threshold": "precision mode (Sensitive/Stringent/Consensus)",
+        "threshold": "prediction mode (sequence-based low/high stringency / Consensus)",
         "citation": "local UTR seed scan",
     },
     "TargetScan": {

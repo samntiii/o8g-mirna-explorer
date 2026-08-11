@@ -28,7 +28,12 @@ _o8g_db = _importlib.reload(_o8g_db)  # pick up ConservationUnavailable across h
 from o8g_db import TargetDB, ConservationUnavailable
 from o8g_enrich import enrich, enrich_within_pool, compare_states, available_libraries
 from o8g_genes import ID_TYPES, GeneResolver
-from o8g_precision import PrecisionMode, PrecisionConfig, mode_value
+from o8g_precision import (
+    PrecisionMode,
+    PrecisionConfig,
+    mode_value,
+    is_high_stringency,
+)
 from o8g_thermo import METRIC_CAPTION, vienna_available
 from o8g_pubthermo import annotate_gene_mirna_hits, PROVENANCE_CAPTION as PUBTHERMO_CAPTION
 import o8g_refsets as refsets
@@ -52,7 +57,7 @@ RANK_LABEL = {1: "6mer", 2: "7mer-A1", 3: "7mer-m8", 4: "8mer"}
 
 # Bump when TargetDB / GeneResolver constructor API changes so Streamlit
 # drops stale @cache_resource instances across hot-reloads.
-_CACHE_VER = 23
+_CACHE_VER = 24
 
 
 @st.cache_resource
@@ -325,17 +330,18 @@ with st.sidebar.expander("OBOE oxo-G prior", expanded=False):
 
 lib = st.sidebar.selectbox("Pathway library", available_libraries(), index=0)
 
-st.sidebar.markdown("### Precision mode")
+st.sidebar.markdown("### Prediction mode")
 _MODE_OPTIONS = [m.value for m in PrecisionMode]
 mode_name = st.sidebar.radio(
     "Target-list filter",
     _MODE_OPTIONS,
-    index=0,  # Sensitive — discovery default
-    key=f"precision_mode_v{_CACHE_VER}",
+    index=0,  # Sequence-based (low stringency) — discovery default
+    key=f"prediction_mode_v{_CACHE_VER}",
     help=(
-        "Sensitive: 7mer-m8+8mer (explorer DB). Stringent: 8mer only. "
-        "TargetScan: explorer ∩ catalog WT predictions. "
-        "TargetScan de novo: live TargetScanS site finding on oxidized seeds "
+        "Sequence-based (low stringency): 7mer-m8+8mer (explorer DB). "
+        "Sequence-based (high stringency): 8mer only. "
+        "TargetScan: explorer ∩ catalog WT predictions (WT baseline anchor). "
+        "TargetScan de novo: live TargetScanS on WT and oxidized seeds "
         "(o8G→T WC encoding; not the web catalog). "
         "Consensus: explorer ∩ TargetScan conserved WT families."
     ),
@@ -343,9 +349,11 @@ mode_name = st.sidebar.radio(
 precision_cfg = PrecisionConfig.from_mode(str(mode_name))
 effective_mode = str(mode_name)
 st.sidebar.caption(
-    "Paper / claims: **Stringent** or **Consensus**. "
-    "**TargetScan** = catalog WT anchor. "
-    "**TargetScan de novo** = novel oxomiR sites via offline TargetScan algorithm. "
+    "Paper / claims: **Sequence-based (high stringency)** or **Consensus**. "
+    "**TargetScan** = catalog WT anchor for lost/gained (ox display lists stay rank≥3). "
+    "**TargetScan de novo** = live TargetScanS on oxidized seeds. "
+    "Catalog TargetScan and de novo can show the **same oxidized gene count** — "
+    "that is expected when both use the same rank≥3 site types on the ox arm. "
     "Gained/lost are always computed after filtering both states."
 )
 
@@ -380,15 +388,21 @@ _consensus_problem = ""
 if mode_name == "Consensus":
     _consensus_problem = _conservation_status(seed, mirna)
     if _consensus_problem:
-        precision_cfg = PrecisionConfig.from_mode("Sensitive")
-        effective_mode = "Sensitive (Consensus unavailable)"
-        st.sidebar.error("Consensus unavailable — showing Sensitive. " + _consensus_problem)
+        precision_cfg = PrecisionConfig.from_mode(PrecisionMode.SENSITIVE)
+        effective_mode = f"{PrecisionMode.SENSITIVE.value} (Consensus unavailable)"
+        st.sidebar.error(
+            "Consensus unavailable — showing sequence-based (low stringency). "
+            + _consensus_problem
+        )
 elif mode_name == "TargetScan":
     _ts_problem = _targetscan_status(mirna)
     if _ts_problem:
-        precision_cfg = PrecisionConfig.from_mode("Sensitive")
-        effective_mode = "Sensitive (TargetScan unavailable)"
-        st.sidebar.error("TargetScan mode unavailable — showing Sensitive. " + _ts_problem)
+        precision_cfg = PrecisionConfig.from_mode(PrecisionMode.SENSITIVE)
+        effective_mode = f"{PrecisionMode.SENSITIVE.value} (TargetScan unavailable)"
+        st.sidebar.error(
+            "TargetScan mode unavailable — showing sequence-based (low stringency). "
+            + _ts_problem
+        )
 
 universe = _utr_universe()
 
@@ -404,9 +418,14 @@ if mode_name == "TargetScan de novo":
                 "`O8G_TS_DENOVO_BACKEND=perl`."
             )
         except Exception as _e:
-            precision_cfg = PrecisionConfig.from_mode("Sensitive")
-            effective_mode = "Sensitive (de novo scanner unavailable)"
-            st.sidebar.error("TargetScan de novo unavailable — showing Sensitive. " + str(_e))
+            precision_cfg = PrecisionConfig.from_mode(PrecisionMode.SENSITIVE)
+            effective_mode = (
+                f"{PrecisionMode.SENSITIVE.value} (de novo scanner unavailable)"
+            )
+            st.sidebar.error(
+                "TargetScan de novo unavailable — showing sequence-based (low stringency). "
+                + str(_e)
+            )
 
 
 def filtered_targets(label, **kw):
@@ -418,9 +437,12 @@ def filtered_targets(label, **kw):
         return db.targets_filtered(seed, label, precision_cfg, mirna=mirna, **kw)
     except ConservationUnavailable as e:
         # Defensive: never crash a view if TS/Consensus/de novo anchor is empty mid-render
-        precision_cfg = PrecisionConfig.from_mode("Sensitive")
-        effective_mode = "Sensitive (anchor unavailable)"
-        st.sidebar.error("Precision anchor unavailable — showing Sensitive. " + str(e))
+        precision_cfg = PrecisionConfig.from_mode(PrecisionMode.SENSITIVE)
+        effective_mode = f"{PrecisionMode.SENSITIVE.value} (anchor unavailable)"
+        st.sidebar.error(
+            "Prediction-mode anchor unavailable — showing sequence-based (low stringency). "
+            + str(e)
+        )
         return db.targets_filtered(seed, label, precision_cfg, mirna=mirna, **kw)
 
 
@@ -435,13 +457,16 @@ min_rank = st.sidebar.select_slider(
     value=3,
     format_func=lambda r: {1: "6mer", 2: "7mer-A1", 3: "7mer-m8", 4: "8mer"}[r],
 )
-st.sidebar.caption("Applied on top of the precision mode (usually leave at 7mer-m8).")
+st.sidebar.caption("Applied on top of the prediction mode (usually leave at 7mer-m8).")
 
 
 # ---------- main ----------
 st.title(f"{mirna}")
 if _consensus_problem:
-    st.error("Consensus unavailable — showing Sensitive. " + _consensus_problem)
+    st.error(
+        "Consensus unavailable — showing sequence-based (low stringency). "
+        + _consensus_problem
+    )
 if len(gpos) == 0:
     st.info("This miRNA's seed contains no guanine, so 8-oxoG oxidation cannot alter its "
             "seed pairing — only one target list exists. Choose a G-containing seed to explore retargeting.")
@@ -585,8 +610,8 @@ elif _SECTION == "Compare two states":
         tA = filtered_targets(sA, scanner=None, mature_dna=info["seq_dna"])
         tB = filtered_targets(sB, scanner=None, mature_dna=info["seq_dna"])
         if "site_rank" in tA.columns:
-            tA = tA[tA["site_rank"] >= max(min_rank, 3 if mode_value(precision_cfg) != "Stringent" else 4)]
-            tB = tB[tB["site_rank"] >= max(min_rank, 3 if mode_value(precision_cfg) != "Stringent" else 4)]
+            tA = tA[tA["site_rank"] >= max(min_rank, 3 if not is_high_stringency(precision_cfg) else 4)]
+            tB = tB[tB["site_rank"] >= max(min_rank, 3 if not is_high_stringency(precision_cfg) else 4)]
         gA = tA["symbol"].tolist()
         gB = tB["symbol"].tolist()
         sa, sb = set(gA), set(gB)
@@ -606,7 +631,7 @@ elif _SECTION == "Compare two states":
         st.caption(
             f"**Lost** = targeted in `{sA}` but not `{sB}` · "
             f"**Gained** = new targets in `{sB}` · **Shared** = targeted in both. "
-            f"Precision mode `{effective_mode}` applied to each state before the set difference."
+            f"Prediction mode `{effective_mode}` applied to each state before the set difference."
         )
         # merge on symbol, carrying each state's best site type
         mA = tA.drop_duplicates("symbol").set_index("symbol")
@@ -751,7 +776,7 @@ elif _SECTION == "All states":
         def _strong_set_all(label: str) -> set[str]:
             df = filtered_targets(label, scanner=None, mature_dna=info["seq_dna"])
             if "site_rank" in df.columns:
-                floor = 4 if mode_value(precision_cfg) == "Stringent" else max(min_rank, 3)
+                floor = 4 if is_high_stringency(precision_cfg) else max(min_rank, 3)
                 df = df[df["site_rank"] >= floor]
             return set(df["symbol"].astype(str))
 
@@ -842,7 +867,7 @@ elif _SECTION in _SECTION_DISPATCH:
     def _strong_set(label: str) -> set[str]:
         df = filtered_targets(label, scanner=None, mature_dna=info["seq_dna"])
         if "site_rank" in df.columns:
-            floor = 4 if mode_value(precision_cfg) == "Stringent" else max(min_rank, 3)
+            floor = 4 if is_high_stringency(precision_cfg) else max(min_rank, 3)
             df = df[df["site_rank"] >= floor]
         return set(df["symbol"].astype(str))
 
@@ -860,7 +885,7 @@ elif _SECTION in _SECTION_DISPATCH:
         matched_background=universe,
         external_refs=refsets,
         precision_cfg=precision_cfg,
-        scanner=_denovo_scanner,
+        scanner=_denovo_scanner or get_scanner(),
     )
     getattr(sections, _SECTION_DISPATCH[_SECTION])(ctx)
 
@@ -1150,12 +1175,16 @@ elif _SECTION == "External DB comparison":
         "Compare **any Explorer oxidation state** (unmodified or o8G) to open external "
         "resources. External DBs only catalog **unmodified** miRNAs — useful for asking "
         "which oxomiR targets are novel vs already known wild-type targets. "
-        "**Explorer** always follows the sidebar precision mode "
+        "**Explorer** always follows the sidebar prediction mode "
         f"(currently `{effective_mode}`). "
         "Optional **TargetScan de novo** is a live TargetScanS rescan of that same "
         "oxidation state (independent of the sidebar mode). "
         "Predicted catalogs: TargetScan 8 / miRDB≥80 / DIANA-microT≥0.7 / miRmap. "
-        "Experimental: ENCORI CLIP; miRTarBase if a local file is present."
+        "Experimental: ENCORI CLIP; miRTarBase if a local file is present. "
+        "Note: **catalog TargetScan** only lists unmodified miRNAs; on an oxidized "
+        "Explorer state, catalog ∩ explorer can look like **TargetScan de novo** "
+        "because both ox arms use the same rank≥3 site types — contrast catalog WT "
+        "TargetScan vs de novo for a true algorithm difference."
     )
     db_state = st.selectbox(
         "Explorer oxidation state",
@@ -1184,7 +1213,7 @@ elif _SECTION == "External DB comparison":
         key="ext_db_ts_denovo",
         help="Live TargetScanS site finding on the selected ox state (o8G→T WC encoding). "
              "Lets you contrast catalog TargetScan (WT only) vs algorithm de novo (ox-aware) "
-             "even when the sidebar precision mode is Sensitive/Stringent.",
+             "even when the sidebar prediction mode is sequence-based.",
     )
     avail = refsets.available_tools()
     default_tools = [t for t, ok in avail.items() if ok and t != "miRTarBase"]
@@ -1196,7 +1225,7 @@ elif _SECTION == "External DB comparison":
         tool_opts,
         default=["Explorer"] + default_tools[:4],
         help=(
-            f"Explorer uses sidebar precision mode `{effective_mode}` on the oxidation "
+            f"Explorer uses sidebar prediction mode `{effective_mode}` on the oxidation "
             "state selected above. Catalog TargetScan is always unmodified WT."
         ),
     )
@@ -1468,6 +1497,6 @@ st.caption("Prediction: seed positions 2–8; unoxidized G pairs C, 8-oxoG (o8G)
            "Gene ID resolution uses a locally cached NCBI/HGNC map (no runtime API). "
            "External DB comparison uses local TargetScan/miRDB/DIANA/miRmap files when present "
            "plus the ENCORI open API; optional **TargetScan de novo** adds a live ox-aware "
-           "TargetScanS set. Explorer follows the sidebar precision mode. An optional lost-gene "
+           "TargetScanS set. Explorer follows the sidebar prediction mode. An optional lost-gene "
            "list ranks Explorer losses by external WT support. Target tables are ranked by "
            "site type (8mer > 7mer-m8 > …).")

@@ -9,29 +9,21 @@ Every filter is applied independently to the unmodified and oxidized target
 tables; gained / lost / shared are set differences *after* filtering.
 Never filter the delta itself.
 
-Modes (PrecisionMode)
----------------------
-Sensitive  — rank >= 3 (7mer-m8 + 8mer). Discovery default in the UI.
-Stringent  — rank == 4 (8mer only). Default for paper / Fig.4 exports.
-Consensus  — rank >= 3 AND TargetScan-conserved on the *unmodified* baseline;
-             oxidized state uses the same rank gate (conservation is undefined
-             for novel o8G motifs in TargetScan — see note below). Deltas =
-             setdiff after filters. Use for main-text quantitative claims.
-TargetScan — rank >= 3 AND TargetScan *predicted* strong sites (8mer+7mer-m8
-             from Predicted_Targets_Info) on the unmodified baseline. Same
-             partition logic as Consensus, but does **not** require conserved-
-             family tables — use when you want catalog predictions alone.
-TargetScan de novo — live TargetScanS site finding on **both** unmodified and
-             oxidized seeds (o8G encoded as T for WC search). Does **not** use
-             the TargetScan web catalog; this is true novel oxomiR prediction
-             via the offline algorithm (``o8g_ts_denovo`` / vendored Perl).
+Modes (PredictionMode / PrecisionMode)
+--------------------------------------
+UI label: **Prediction mode**.
 
-Deprecated alias
+Sequence-based (low stringency)  — formerly Sensitive; rank >= 3 (7mer-m8 + 8mer).
+Sequence-based (high stringency) — formerly Stringent; rank == 4 (8mer only).
+TargetScan — rank >= 3 AND TargetScan *predicted* strong sites on the *unmodified*
+             baseline (Predicted_Targets_Info). Catalog WT anchor for lost/gained;
+             oxidized-state *display* lists remain rank≥3 (same site types as de novo).
+TargetScan de novo — live TargetScanS on WT **and** oxidized seeds (o8G→T WC).
+Consensus — rank >= 3 AND TargetScan-conserved on the unmodified baseline.
+
+Deprecated aliases
 ----------------
-"HighConf" previously meant SITE_WEIGHT score ≥ 1.0, but without stored
-multiplicity blobs that gate collapsed to 8mer-only (= Stringent) and recovered
-the fewest gold effects. It is merged into Stringent; ``from_mode("HighConf")``
-still resolves for backward compatibility.
+``Sensitive`` / ``Stringent`` / ``HighConf`` still resolve via ``from_mode``.
 
 Conservation note
 -----------------
@@ -55,10 +47,13 @@ import pandas as pd
 
 
 class PrecisionMode(Enum):
-    """Not a ``str`` Enum — Streamlit reloads break ``isinstance(member, str)`` paths."""
+    """Prediction-mode ladder (enum name kept for API stability).
 
-    SENSITIVE = "Sensitive"
-    STRINGENT = "Stringent"
+    Not a ``str`` Enum — Streamlit reloads break ``isinstance(member, str)`` paths.
+    """
+
+    SENSITIVE = "Sequence-based (low stringency)"
+    STRINGENT = "Sequence-based (high stringency)"
     TARGETSCAN = "TargetScan"
     TS_DENOVO = "TargetScan de novo"
     CONSENSUS = "Consensus"
@@ -67,10 +62,14 @@ class PrecisionMode(Enum):
         return self.value
 
 
-# Old UI / CSV label → current mode value string (HighConf was a Stringent duplicate).
+# Legacy UI / CSV labels → current mode value strings
 _MODE_ALIASES = {
-    "HighConf": "Stringent",
-    "highconf": "Stringent",
+    "HighConf": "Sequence-based (high stringency)",
+    "highconf": "Sequence-based (high stringency)",
+    "Sensitive": "Sequence-based (low stringency)",
+    "Stringent": "Sequence-based (high stringency)",
+    "Sequence-based (low stringency)": "Sequence-based (low stringency)",
+    "Sequence-based (high stringency)": "Sequence-based (high stringency)",
 }
 
 
@@ -101,6 +100,15 @@ def mode_value(mode: object) -> str:
         if m.value in text or m.name in text:
             return m.value
     raise TypeError(f"Cannot read precision mode value from {type(mode)!r}: {mode!r}")
+
+
+def is_high_stringency(mode: object) -> bool:
+    """True for Sequence-based (high stringency) / legacy Stringent."""
+    return mode_value(mode) == PrecisionMode.STRINGENT.value
+
+
+def is_low_stringency(mode: object) -> bool:
+    return mode_value(mode) == PrecisionMode.SENSITIVE.value
 
 
 def _coerce_mode(mode: PrecisionMode | str | object) -> PrecisionMode:
@@ -218,7 +226,7 @@ def partition_after_filter(
     cfg = PrecisionConfig.from_mode(cfg)
     mode_s = cfg.mode_label
     # Consensus / TargetScan catalog: special gain/loss anchoring
-    # TargetScan de novo + Sensitive/Stringent: plain setdiff after filters
+    # TargetScan de novo + sequence-based modes: plain setdiff after filters
     if mode_s not in (PrecisionMode.CONSENSUS.value, PrecisionMode.TARGETSCAN.value):
         u = apply_precision_filter(
             unmod, cfg, conserved_symbols=conserved_symbols, is_unmodified_state=True

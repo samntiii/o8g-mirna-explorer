@@ -275,8 +275,8 @@ class TargetDB:
         except FileNotFoundError as e:
             raise ConservationUnavailable(
                 "Consensus mode requires paper/data/Conserved_Family_Info.txt "
-                "(TargetScanHuman 8.0), which is not installed. Use Sensitive "
-                "or Stringent, or add the TargetScan release files."
+                "(TargetScanHuman 8.0), which is not installed. Use sequence-based "
+                "(low/high stringency), or add the TargetScan release files."
             ) from e
         except ConservationUnavailable:
             raise
