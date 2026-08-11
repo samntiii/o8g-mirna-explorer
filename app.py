@@ -47,7 +47,7 @@ RANK_LABEL = {1: "6mer", 2: "7mer-A1", 3: "7mer-m8", 4: "8mer"}
 
 # Bump when TargetDB / GeneResolver constructor API changes so Streamlit
 # drops stale @cache_resource instances across hot-reloads.
-_CACHE_VER = 18
+_CACHE_VER = 19
 
 
 @st.cache_resource
@@ -389,7 +389,15 @@ universe = _utr_universe()
 
 def filtered_targets(label, **kw):
     """Single entry point so no call site bypasses the precision ladder."""
-    return db.targets_filtered(seed, label, precision_cfg, mirna=mirna, **kw)
+    global precision_cfg, effective_mode
+    try:
+        return db.targets_filtered(seed, label, precision_cfg, mirna=mirna, **kw)
+    except ConservationUnavailable as e:
+        # Defensive: never crash a view if TS/Consensus anchor is empty mid-render
+        precision_cfg = PrecisionConfig.from_mode("Sensitive")
+        effective_mode = "Sensitive (anchor unavailable)"
+        st.sidebar.error("Precision anchor unavailable — showing Sensitive. " + str(e))
+        return db.targets_filtered(seed, label, precision_cfg, mirna=mirna, **kw)
 
 
 # Do NOT build TargetScanner (~40s) on every page load — only when thermo / live

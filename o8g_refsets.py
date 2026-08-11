@@ -40,17 +40,67 @@ DIANA_SCORE_MIN = 0.7
 MIRMAP_PERCENTILE_MIN = 80.0
 ENCORI_CLIP_MIN = 1
 
-# Known TargetScan families for common miRNAs (extend via Summary_Counts when needed)
+# Known TargetScan families for common miRNAs (extend via resolve_targetscan_family)
 TS_FAMILIES = {
     "hsa-miR-1-3p": "miR-1-3p/206",
+    "hsa-miR-206": "miR-1-3p/206",
     "hsa-miR-124-3p": "miR-124-3p.1",
     "hsa-let-7a-5p": "let-7-5p/98-5p",
+    "hsa-let-7b-5p": "let-7-5p/98-5p",
+    "hsa-let-7c-5p": "let-7-5p/98-5p",
+    "hsa-let-7d-5p": "let-7-5p/98-5p",
+    "hsa-let-7e-5p": "let-7-5p/98-5p",
+    "hsa-let-7f-5p": "let-7-5p/98-5p",
+    "hsa-let-7g-5p": "let-7-5p/98-5p",
+    "hsa-let-7i-5p": "let-7-5p/98-5p",
+    "hsa-miR-98-5p": "let-7-5p/98-5p",
     "hsa-miR-122-5p": "miR-122-5p",
     "hsa-miR-21-5p": "miR-21-5p",
     "hsa-miR-155-5p": "miR-155-5p",
     "hsa-miR-17-5p": "miR-17-5p/20-5p/93-5p/106-5p",
     "hsa-miR-34a-5p": "miR-34-5p/449-5p",
 }
+
+# Alternate family strings that appear in Predicted_Targets_Info across species rows
+_TS_FAMILY_ALIASES: dict[str, set[str]] = {
+    "let-7-5p/98-5p": {
+        "let-7-5p/98-5p",
+        "let-7/98",
+        "let-7-5p/miR-98",
+        "let-7-5p/miR-98-5p",
+        "let-7-5p/miR-98/6134",
+    },
+    "miR-1-3p/206": {"miR-1-3p/206", "miR-1-3p/206/6132", "miR-1/206"},
+}
+
+
+def resolve_targetscan_family(mirna: str) -> str | None:
+    """Map a mature miRNA name to its TargetScan family string when known."""
+    if mirna in TS_FAMILIES:
+        return TS_FAMILIES[mirna]
+    stem = mirna.replace("hsa-", "")
+    # All let-7*-5p + miR-98-5p share one conserved/predicted family in TS8
+    if stem.lower() == "mir-98-5p":
+        return "let-7-5p/98-5p"
+    if stem.startswith("let-7") and stem.endswith("-5p"):
+        return "let-7-5p/98-5p"
+    if stem in ("miR-1-3p", "miR-206"):
+        return "miR-1-3p/206"
+    return None
+
+
+def _family_column_matches(fam_col: str, wanted: str | None, mirna: str) -> bool:
+    if not fam_col:
+        return False
+    if wanted:
+        aliases = _TS_FAMILY_ALIASES.get(wanted, {wanted})
+        if fam_col in aliases or fam_col == wanted:
+            return True
+        # substring only when wanted is a clean token (avoid "7" matching everything)
+        if wanted in fam_col:
+            return True
+    stem = mirna.replace("hsa-", "")
+    return bool(stem and stem in fam_col)
 
 MIRNA_TO_MIMAT = {
     "hsa-let-7a-5p": "MIMAT0000062",
@@ -155,15 +205,19 @@ def available_tools() -> dict[str, bool]:
 
 def load_targetscan(mirna: str) -> set[str]:
     cached = _load_cache("TargetScan", mirna)
-    if cached is not None:
+    # Never trust an empty cache entry (legacy poison from failed name match)
+    if cached:
         return cached
+    if cached is not None and len(cached) == 0:
+        try:
+            _cache_path("TargetScan", mirna).unlink(missing_ok=True)
+        except Exception:
+            pass
+
     path = DATA / "Predicted_Targets_Info.default_predictions.txt"
     if not path.exists():
         return set()
-    fam = TS_FAMILIES.get(mirna)
-    if not fam:
-        # try match by miRNA name substring in family column via Summary_Counts
-        fam = mirna.replace("hsa-", "")
+    fam = resolve_targetscan_family(mirna)
     out: set[str] = set()
     with open(path) as f:
         f.readline()
@@ -173,12 +227,10 @@ def load_targetscan(mirna: str) -> set[str]:
                 continue
             if p[9] not in ("8mer", "7mer-m8"):
                 continue
-            if fam and (p[0] == fam or fam in p[0] or mirna.replace("hsa-", "") in p[1]):
+            if _family_column_matches(p[0], fam, mirna):
                 out.add(p[2])
-            elif not fam and mirna.replace("hsa-", "") in (p[0] + p[1]):
-                out.add(p[2])
-    # If family was approximate and empty, don't cache empty forever for unknown mirs
-    if out or mirna in TS_FAMILIES:
+    # Only cache non-empty hits (empty = unknown / missing, retry next time)
+    if out:
         _save_cache("TargetScan", mirna, out)
     return out
 
