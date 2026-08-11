@@ -1,35 +1,26 @@
-"""Loss-of-function view: miRDB-anchored baseline attrition (optional file)."""
+"""Loss-of-function / state attrition helpers (miRDB-anchored + Explorer gained/lost)."""
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from o8g_enrich import enrich, enrich_within_pool
 from o8g_sections import SectionContext
 
 ROOT = Path(__file__).resolve().parent
 
 
-def enrich_within_baseline(query_genes, baseline_genes, library: str = "GO_BP", **kw):
-    """Alias kept for callers expecting the LoF-shaped API."""
-    return enrich_within_pool(query_genes, baseline_genes, library=library, **kw)
-
-
 def _load_mirdb(mirna: str, score_min: float) -> set[str] | None:
-    """Return miRDB symbols for mirna at score >= cutoff, or None if file missing."""
+    """Return miRDB symbols for mirna at score >= cutoff, or None if unavailable."""
     candidates = [
         ROOT / "mirdb_ref.parquet",
         ROOT / "paper" / "data" / "mirdb_ref.parquet",
         ROOT / "mirdb_custom_cache.db",
     ]
-    present = [p for p in candidates if p.exists()]
-    if not present:
-        return None
-    # Prefer parquet extract if present
-    for p in present:
+    for p in candidates:
+        if not p.exists():
+            continue
         if p.suffix == ".parquet":
             try:
                 df = pd.read_parquet(p)
@@ -43,71 +34,94 @@ def _load_mirdb(mirna: str, score_min: float) -> set[str] | None:
                 return set(sub[sym_col].astype(str).str.upper())
             except Exception:
                 continue
-    return set()  # file present but unreadable shape → empty with warning upstream
+        if p.suffix == ".db" or p.name.endswith(".db"):
+            try:
+                import sqlite3
+
+                con = sqlite3.connect(p)
+                try:
+                    rows = con.execute(
+                        "SELECT symbol FROM mirdb WHERE mirna=? AND score>=?",
+                        (mirna, float(score_min)),
+                    ).fetchall()
+                except sqlite3.Error:
+                    rows = []
+                con.close()
+                if rows:
+                    return {str(r[0]).upper() for r in rows}
+            except Exception:
+                continue
+    try:
+        import o8g_refsets as refsets
+
+        if refsets.available_tools().get("miRDB"):
+            return {g.upper() for g in refsets.load_mirdb(mirna, score_min=float(score_min))}
+    except Exception:
+        pass
+    return None
 
 
-def render(ctx: SectionContext) -> None:
-    st.markdown(f"#### Loss of function (miRDB-anchored attrition) · `{ctx.precision_mode}`")
-    st.warning(
-        "miRDB catalogs **unmodified** matures only. The anchored oxidized set is "
-        "`baseline ∩ oxidized_strong`, so **gained is identically 0 by construction** — "
-        "structural, not measured. Use this view for loss/attrition only; do not treat "
-        "gained≡0 as a biological finding."
-    )
-    score = st.slider("miRDB score cutoff", min_value=50, max_value=100, value=80, step=5)
-    baseline = _load_mirdb(ctx.mirna, float(score))
-    if baseline is None:
-        st.error(
-            "miRDB reference missing. Expected `mirdb_ref.parquet` (or "
-            "`mirdb_custom_cache.db`) next to the app. Attrition plot unavailable."
-        )
-        # Still show Explorer-only loss fractions so the section does not crash.
-        baseline = ctx.strong_set("none")
-        st.caption("Falling back to Explorer unmodified strong set as a temporary baseline.")
-        anchored = True
-    else:
-        anchored = True
-        if len(baseline) == 0:
-            st.warning("miRDB file present but returned 0 genes for this miRNA/cutoff.")
-
+def state_summary_table(ctx: SectionContext, *, mirdb_score: float = 80.0) -> pd.DataFrame:
+    """Per-ox-state lost / gained / shared vs unmodified, plus optional miRDB attrition."""
+    unmod = {g.upper() for g in ctx.strong_set("none")}
+    baseline = _load_mirdb(ctx.mirna, float(mirdb_score))
     ox_labels = [s for s in ctx.state_labels if s != "none"]
     rows = []
     for lab in ox_labels:
-        ox = ctx.strong_set(lab)
-        anchored_ox = baseline & ox
-        lost = baseline - ox
-        rows.append(
-            {
-                "state": lab,
-                "baseline": len(baseline),
-                "anchored_oxidized": len(anchored_ox),
-                "lost": len(lost),
-                "retained_frac": (len(anchored_ox) / len(baseline)) if baseline else 0.0,
-                "gained_structural_zero": 0,
-            }
-        )
-    tab = pd.DataFrame(rows)
-    st.dataframe(tab, width="stretch", hide_index=True)
-    if len(tab):
-        st.bar_chart(tab.set_index("state")["lost"])
+        ox = {g.upper() for g in ctx.strong_set(lab)}
+        lost = unmod - ox
+        gained = ox - unmod
+        shared = unmod & ox
+        row = {
+            "state": lab,
+            "n_unmod": len(unmod),
+            "n_oxidized": len(ox),
+            "lost": len(lost),
+            "gained": len(gained),
+            "shared": len(shared),
+            "retained_frac": (len(shared) / len(unmod)) if unmod else 0.0,
+        }
+        if baseline is not None:
+            row["mirdb_baseline"] = len(baseline)
+            row["mirdb_lost"] = len(baseline - ox)
+            row["mirdb_retained"] = len(baseline & ox)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def render_state_summary(ctx: SectionContext) -> None:
+    """Compact LoF / gained table for embedding in All states."""
+    st.markdown("##### Target attrition across oxidation states")
     st.caption(
-        f"Vulnerability summary for {ctx.mirna}: median lost = "
-        f"{tab['lost'].median() if len(tab) else 0:.0f} of {len(baseline)} baseline genes."
+        "Lost / gained / shared are Explorer set-differences vs unmodified under the "
+        "current precision mode. Optional **miRDB_lost** is attrition from a WT miRDB "
+        "baseline (miRDB has no oxomiR catalog — that column is loss-only)."
+    )
+    score = st.slider(
+        "miRDB score cutoff (for mirdb_lost column)",
+        min_value=50,
+        max_value=100,
+        value=80,
+        step=5,
+        key="allstates_mirdb_score",
+    )
+    tab = state_summary_table(ctx, mirdb_score=float(score))
+    if tab.empty:
+        st.info("No oxidized states for this seed.")
+        return
+    show = tab.copy()
+    st.dataframe(show, width="stretch", hide_index=True)
+    chart_cols = [c for c in ("lost", "gained") if c in show.columns]
+    if chart_cols:
+        st.bar_chart(show.set_index("state")[chart_cols])
+    st.caption(
+        f"{ctx.mirna}: median lost={show['lost'].median():.0f}, "
+        f"median gained={show['gained'].median():.0f} "
+        f"(n_unmod={int(show['n_unmod'].iloc[0]) if len(show) else 0})."
     )
 
-    # Dual enrichment on none→first ox state
-    if ox_labels and len(baseline) >= 5:
-        lab = "o8G@7" if "o8G@7" in ox_labels else ox_labels[0]
-        lost = baseline - ctx.strong_set(lab)
-        pool = baseline  # within-baseline control
-        eg = enrich(list(lost), ctx.library, background=ctx.universe, top=15)
-        ep = enrich_within_baseline(list(lost), pool, library=ctx.library, top=15)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown(f"**Lost vs UTR universe** ({lab})")
-            st.metric("q<0.05 terms", int((eg["q_value"] < 0.05).sum()) if len(eg) else 0)
-            st.dataframe(eg[["term", "overlap", "q_value"]] if len(eg) else eg, hide_index=True, height=200)
-        with c2:
-            st.markdown(f"**Lost within miRDB baseline** ({lab})")
-            st.metric("q<0.05 terms", int((ep["q_value"] < 0.05).sum()) if len(ep) else 0)
-            st.dataframe(ep[["term", "overlap", "q_value"]] if len(ep) else ep, hide_index=True, height=200)
+
+def render(ctx: SectionContext) -> None:
+    """Standalone view kept for back-compat; prefer All states embedding."""
+    st.markdown(f"#### Loss of function / state summary · `{ctx.precision_mode}`")
+    render_state_summary(ctx)

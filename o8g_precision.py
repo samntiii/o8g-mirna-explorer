@@ -17,6 +17,10 @@ Consensus  — rank >= 3 AND TargetScan-conserved on the *unmodified* baseline;
              oxidized state uses the same rank gate (conservation is undefined
              for novel o8G motifs in TargetScan — see note below). Deltas =
              setdiff after filters. Use for main-text quantitative claims.
+TargetScan — rank >= 3 AND TargetScan *predicted* strong sites (8mer+7mer-m8
+             from Predicted_Targets_Info) on the unmodified baseline. Same
+             partition logic as Consensus, but does **not** require conserved-
+             family tables — use when you want catalog predictions alone.
 
 Deprecated alias
 ----------------
@@ -49,6 +53,7 @@ import pandas as pd
 class PrecisionMode(str, Enum):
     SENSITIVE = "Sensitive"
     STRINGENT = "Stringent"
+    TARGETSCAN = "TargetScan"
     CONSENSUS = "Consensus"
 
 
@@ -147,13 +152,15 @@ def apply_precision_filter(
         out = out[out["site_rank"] >= 3]
     elif mode_s == PrecisionMode.STRINGENT.value:
         out = out[out["site_rank"] >= 4]
-    elif mode_s == PrecisionMode.CONSENSUS.value:
+    elif mode_s in (PrecisionMode.CONSENSUS.value, PrecisionMode.TARGETSCAN.value):
         out = out[out["site_rank"] >= 3]
         if use_cons and is_unmodified_state:
-            if "is_conserved" in out.columns:
+            if mode_s == PrecisionMode.CONSENSUS.value and "is_conserved" in out.columns:
                 out = out[out["is_conserved"].astype(bool)]
             elif conserved_symbols is not None:
-                out = out[out["symbol"].isin(conserved_symbols)]
+                # TargetScan predictions, or Consensus when is_conserved column absent
+                syms = {str(s).upper() for s in conserved_symbols}
+                out = out[out["symbol"].astype(str).str.upper().isin(syms)]
         # oxidized: rank gate only (TargetScan has no o8G motifs)
     else:
         raise ValueError(f"Unknown precision mode: {mode_s!r}")
@@ -176,7 +183,8 @@ def partition_after_filter(
     rank-filtered unmodified set — so gains remain true o8G retargeting events,
     not artifacts of dropping non-conserved unmodified targets.
     """
-    if str(getattr(cfg.mode, "value", cfg.mode)) != PrecisionMode.CONSENSUS.value:
+    mode_s = str(getattr(cfg.mode, "value", cfg.mode))
+    if mode_s not in (PrecisionMode.CONSENSUS.value, PrecisionMode.TARGETSCAN.value):
         u = apply_precision_filter(
             unmod, cfg, conserved_symbols=conserved_symbols, is_unmodified_state=True
         )
@@ -193,7 +201,7 @@ def partition_after_filter(
             "gained": so - su,
         }
 
-    # Consensus
+    # Consensus / TargetScan: anchor shrinks unmodified baseline; gains use rank-only
     u_rank = apply_precision_filter(
         unmod,
         PrecisionConfig(mode=PrecisionMode.SENSITIVE),
@@ -206,16 +214,16 @@ def partition_after_filter(
     )
     su_rank = set(u_rank["symbol"]) if len(u_rank) else set()
     so_rank = set(o_rank["symbol"]) if len(o_rank) else set()
-    u_cons = apply_precision_filter(
+    u_anch = apply_precision_filter(
         unmod, cfg, conserved_symbols=conserved_symbols, is_unmodified_state=True
     )
-    su_cons = set(u_cons["symbol"]) if len(u_cons) else set()
+    su_anch = set(u_anch["symbol"]) if len(u_anch) else set()
     return {
-        "unmod": su_cons,  # conserved baseline for claims
+        "unmod": su_anch,
         "oxid": so_rank,
-        "shared": su_cons & so_rank,
-        "lost": su_cons - so_rank,  # conserved targets lost on oxidation
-        "gained": so_rank - su_rank,  # true chemical gains (rank gate only)
+        "shared": su_anch & so_rank,
+        "lost": su_anch - so_rank,
+        "gained": so_rank - su_rank,
     }
 
 

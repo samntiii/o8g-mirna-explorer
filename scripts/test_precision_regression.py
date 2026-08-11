@@ -47,6 +47,7 @@ def main() -> int:
         mins = {
             PrecisionMode.SENSITIVE: (500, 500, 500),
             PrecisionMode.STRINGENT: (50, 50, 50),
+            PrecisionMode.TARGETSCAN: (50, 50, 50),
             PrecisionMode.CONSENSUS: (20, 20, 20),
         }[mode]
         assert_retargeting_signal(

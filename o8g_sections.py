@@ -26,18 +26,23 @@ class SectionContext:
     universe: set[str]
     matched_background: set[str]
     external_refs: object
+    precision_cfg: object | None = None
 
 
 def render_overlap(ctx: SectionContext) -> None:
-    from o8g_venn import render as _render
+    import importlib
+    import o8g_venn as _mod
 
-    _render(ctx)
+    _mod = importlib.reload(_mod)
+    _mod.render(ctx)
 
 
 def render_tf(ctx: SectionContext) -> None:
-    from o8g_tf import render as _render
+    import importlib
+    import o8g_tf as _mod
 
-    _render(ctx)
+    _mod = importlib.reload(_mod)
+    _mod.render(ctx)
 
 
 def render_lof(ctx: SectionContext) -> None:
@@ -53,6 +58,16 @@ def render_stats(ctx: SectionContext) -> None:
 
 
 def render_antagomir(ctx: SectionContext) -> None:
-    from o8g_anti import render as _render
+    import importlib
+    import o8g_energy as _energy
+    import o8g_anti as _mod
+
+    importlib.reload(_energy)
+    _mod = importlib.reload(_mod)
+    _mod.render(ctx)
+
+
+def render_deg_upload(ctx: SectionContext) -> None:
+    from o8g_deg_upload import render as _render
 
     _render(ctx)

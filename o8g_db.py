@@ -283,6 +283,41 @@ class TargetDB:
             )
         return syms
 
+    def _targetscan_for(self, mirna: str | None) -> set[str]:
+        if not mirna:
+            raise ConservationUnavailable(
+                "TargetScan mode needs the miRNA name to look up Predicted_Targets_Info."
+            )
+        try:
+            import o8g_refsets as refsets
+
+            if not refsets.available_tools().get("TargetScan"):
+                raise ConservationUnavailable(
+                    "TargetScan mode requires paper/data/Predicted_Targets_Info."
+                    "default_predictions.txt (TargetScanHuman 8.0 predictions)."
+                )
+            syms = {str(s).upper() for s in refsets.load_targetscan(mirna)}
+        except ConservationUnavailable:
+            raise
+        except Exception as e:
+            raise ConservationUnavailable(
+                f"TargetScan prediction lookup failed ({type(e).__name__}): {e}"
+            ) from e
+        if not syms:
+            raise ConservationUnavailable(
+                f"TargetScan returned no predicted strong sites for {mirna}; "
+                "refusing to run TargetScan mode on an empty baseline."
+            )
+        return syms
+
+    def _anchor_symbols_for(self, cfg: PrecisionConfig, seed, mirna: str | None):
+        mode_s = str(getattr(cfg.mode, "value", cfg.mode))
+        if mode_s == PrecisionMode.CONSENSUS.value:
+            return self._conserved_for(seed, mirna)
+        if mode_s == PrecisionMode.TARGETSCAN.value:
+            return self._targetscan_for(mirna)
+        return None
+
     def targets_filtered(
         self,
         seed: str,
@@ -296,11 +331,8 @@ class TargetDB:
     ) -> pd.DataFrame:
         # Always re-hydrate onto this module's PrecisionConfig (Streamlit reload-safe)
         cfg = PrecisionConfig.from_mode(cfg)
-        if (
-            conserved_symbols is None
-            and str(getattr(cfg.mode, "value", cfg.mode)) == PrecisionMode.CONSENSUS.value
-        ):
-            conserved_symbols = self._conserved_for(seed, mirna)
+        if conserved_symbols is None:
+            conserved_symbols = self._anchor_symbols_for(cfg, seed, mirna)
         df = self.targets_enriched(
             seed,
             label,
@@ -326,11 +358,8 @@ class TargetDB:
         cfg = PrecisionConfig.from_mode(cfg)
         mirna = kwargs.get("mirna")
         conserved_symbols = kwargs.get("conserved_symbols")
-        if (
-            conserved_symbols is None
-            and str(getattr(cfg.mode, "value", cfg.mode)) == PrecisionMode.CONSENSUS.value
-        ):
-            conserved_symbols = self._conserved_for(seed, mirna)
+        if conserved_symbols is None:
+            conserved_symbols = self._anchor_symbols_for(cfg, seed, mirna)
         unmod = self.targets_enriched(
             seed,
             "none",
@@ -422,6 +451,88 @@ class TargetDB:
         gt["oxidized_positions"] = gt["oxidized_positions"].fillna("")
         return (
             gt[empty_cols]
+            .sort_values(["mirna", "state_label", "site_rank"], ascending=[True, True, False])
+            .reset_index(drop=True)
+        )
+
+    def states_lost_on_oxidation(self, gene_idx: int) -> pd.DataFrame:
+        """Unmodified strong-site hits that are absent under an oxidized state of the same seed.
+
+        Reverse index only stores states that *target* the gene, so loss is inferred:
+        seed has ``none`` → gene, and an oxidized label for that seed is not in
+        ``gene_targets`` for this gene. Each row is one (seed, oxidized state) loss.
+        ``site_rank`` / ``site_type`` are from the unmodified hit that was lost.
+        """
+        empty_cols = [
+            "mirna",
+            "all_mirnas",
+            "seed",
+            "state_label",
+            "oxidized_positions",
+            "site_rank",
+            "site_type",
+            "motif_7mer_m8",
+            "motif_8mer",
+            "vs_unmodified",
+        ]
+        rev = self._rev_con()
+        gt = pd.read_sql(
+            "SELECT seed, label AS state_label, site_rank, oxidized_positions "
+            "FROM gene_targets WHERE gene_idx=?",
+            rev,
+            params=[int(gene_idx)],
+        )
+        if gt.empty:
+            return pd.DataFrame(columns=empty_cols)
+
+        none_hits = gt[gt["state_label"] == "none"].copy()
+        if none_hits.empty:
+            return pd.DataFrame(columns=empty_cols)
+
+        none_seeds = none_hits["seed"].unique().tolist()
+        ph = ",".join("?" * len(none_seeds))
+
+        # All precomputed states for seeds that target this gene when unmodified
+        all_states = pd.read_sql(
+            f"SELECT seed, label AS state_label, motif_7mer_m8, motif_8mer "
+            f"FROM states WHERE seed IN ({ph})",
+            self._con,
+            params=none_seeds,
+        )
+        present = set(zip(gt["seed"].astype(str), gt["state_label"].astype(str)))
+        ox_states = all_states[all_states["state_label"] != "none"].copy()
+        ox_states["_key"] = list(zip(ox_states["seed"].astype(str), ox_states["state_label"].astype(str)))
+        ox_states = ox_states[~ox_states["_key"].isin(present)].drop(columns=["_key"])
+        if ox_states.empty:
+            return pd.DataFrame(columns=empty_cols)
+
+        # Attach unmodified site quality (what was lost)
+        none_site = none_hits.drop_duplicates("seed").set_index("seed")["site_rank"]
+        ox_states["site_rank"] = ox_states["seed"].map(none_site)
+
+        sm = pd.read_sql(
+            f"SELECT seed, mirna FROM seed_mirnas WHERE seed IN ({ph})",
+            rev,
+            params=none_seeds,
+        )
+        mir_map: dict[str, list[str]] = {}
+        for seed, mirna in sm.itertuples(index=False):
+            mir_map.setdefault(seed, []).append(mirna)
+
+        def _ox_pos(label: str) -> str:
+            if not label or label == "none":
+                return ""
+            return label.replace("o8G@", "")
+
+        ox_states["mirna"] = ox_states["seed"].map(lambda s: _primary_mirna(mir_map.get(s, [])))
+        ox_states["all_mirnas"] = ox_states["seed"].map(
+            lambda s: ";".join(sorted(mir_map.get(s, [])))
+        )
+        ox_states["site_type"] = ox_states["site_rank"].map(RANK_SITE)
+        ox_states["vs_unmodified"] = "lost on oxidation"
+        ox_states["oxidized_positions"] = ox_states["state_label"].map(_ox_pos)
+        return (
+            ox_states[empty_cols]
             .sort_values(["mirna", "state_label", "site_rank"], ascending=[True, True, False])
             .reset_index(drop=True)
         )

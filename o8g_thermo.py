@@ -267,9 +267,9 @@ def score_targets_thermo(
 
 
 METRIC_CAPTION = (
-    "Binding metrics: **BE** = engine rank score (site + multiplicity + context analog + conservation). "
-    "**dG_RNAduplex** = ViennaRNA duplexfold (kcal/mol; more negative → stronger). "
+    "Optional energetics: **dG_RNAduplex** = ViennaRNA duplexfold (kcal/mol; more negative → stronger). "
     "**dG_RNAup** = duplex + seed opening energy (RNAup/IntaRNA-style; more negative → stronger & accessible). "
     "**contextpp_TargetScan** = official TargetScan 8 weighted context++ (unmodified only; more negative → stronger). "
-    "o8G duplex uses G→U proxy at oxidized seed positions."
+    "o8G duplex uses G→U proxy at oxidized seed positions. "
+    "Default ranking is by site type (8mer > 7mer-m8 > 7mer-A1 > 6mer)."
 )

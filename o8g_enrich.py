@@ -46,14 +46,31 @@ LIBRARY_FILES = {
     "KEGG": "KEGG_2021_Human.gmt",
     "Reactome": "Reactome_2022.gmt",
     "Hallmark": "MSigDB_Hallmark_2020.gmt",
-    # TF / ChIP libraries (optional — views degrade if files absent)
+    # TF motif / ChIP libraries (optional — views degrade if files absent)
+    # Fetch: python scripts/fetch_tf_genesets.py
+    "TRANSFAC_JASPAR": "TRANSFAC_and_JASPAR_PWMs.gmt",
+    "JASPAR_2025": "JASPAR_PWM_Human_2025.gmt",
+    "GenomeBrowser_PWM": "Genome_Browser_PWMs.gmt",  # UCSC/ENCODE ≈ Ensembl-adjacent PWMs
+    "ENCODE_ChEA_Consensus": "ENCODE_and_ChEA_Consensus_TFs_from_ChIP-X.gmt",
     "ChEA_TF": "ChEA_2022.gmt",
     "ENCODE_TF": "ENCODE_TF_ChIP-seq_2015.gmt",
     "TRRUST_TF": "TRRUST_Transcription_Factors_2019.gmt",
     "TF_Perturb": "TF_Perturbations_Followed_by_Expression.gmt",
 }
 
-TF_LIBRARIES = ("ChEA_TF", "ENCODE_TF", "TRRUST_TF", "TF_Perturb")
+# Motif-first defaults, then ChIP / curated TF–target networks
+TF_LIBRARIES = (
+    "TRANSFAC_JASPAR",
+    "JASPAR_2025",
+    "GenomeBrowser_PWM",
+    "ENCODE_ChEA_Consensus",
+    "ChEA_TF",
+    "ENCODE_TF",
+    "TRRUST_TF",
+    "TF_Perturb",
+)
+
+TF_MOTIF_LIBRARIES = ("TRANSFAC_JASPAR", "JASPAR_2025", "GenomeBrowser_PWM")
 
 
 @lru_cache(maxsize=None)
@@ -82,6 +99,15 @@ def available_libraries() -> list[str]:
         if k in LIBRARY_FILES and os.path.exists(os.path.join(GENESET_DIR, LIBRARY_FILES[k])):
             out.append(k)
     return out
+
+
+def available_tf_libraries() -> list[str]:
+    return [
+        k
+        for k in TF_LIBRARIES
+        if k in LIBRARY_FILES
+        and os.path.exists(os.path.join(GENESET_DIR, LIBRARY_FILES[k]))
+    ]
 
 
 def _library_universe(sets) -> set[str]:
@@ -125,9 +151,22 @@ def enrich(query_genes, library: str = "GO_BP", background: int | Iterable | Non
         pval = hypergeom.sf(k - 1, N, M, q)
         expected = q * M / N if N else np.nan
         odds = (k / expected) if expected else np.nan
-        rows.append((term, k, q, M, expected, odds, pval, N))
-    df = pd.DataFrame(rows, columns=["term", "overlap", "query_size", "term_size",
-                                     "expected", "odds_ratio", "p_value", "background_size"])
+        genes = ";".join(sorted(Q & P))
+        rows.append((term, k, q, M, expected, odds, pval, N, genes))
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "term",
+            "overlap",
+            "query_size",
+            "term_size",
+            "expected",
+            "odds_ratio",
+            "p_value",
+            "background_size",
+            "genes",
+        ],
+    )
     if len(df):
         df = df.sort_values("p_value").reset_index(drop=True)
         m = len(df)

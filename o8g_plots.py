@@ -299,10 +299,9 @@ def upset_plotly(sets: dict[str, set], max_intersections: int = 40):
     fig = make_subplots(
         rows=2,
         cols=1,
-        row_heights=[0.55, 0.45],
+        row_heights=[0.58, 0.42],
         shared_xaxes=True,
-        vertical_spacing=0.06,
-        subplot_titles=("Intersection size", "Set membership"),
+        vertical_spacing=0.10,
     )
     fig.add_trace(
         go.Bar(x=list(range(len(rows))), y=sizes, marker_color="#4C72B0", name="size",
@@ -315,17 +314,18 @@ def upset_plotly(sets: dict[str, set], max_intersections: int = 40):
         for j, name in enumerate(names):
             xs.append(i)
             ys.append(j)
-            colors.append("#F5F5F5" if name in r["combo"] else "#2A2A2A")
-            # light = in set (positive); dark = out (negative) — readable on dark UI
+            colors.append("#4C72B0" if name in r["combo"] else "#E8E8E8")
     fig.add_trace(
         go.Scatter(
             x=xs, y=ys, mode="markers",
             marker=dict(
-                size=12,
+                size=11,
                 color=colors,
                 line=dict(width=1, color="#888888"),
             ),
-            showlegend=False, hoverinfo="skip",
+            showlegend=False,
+            hoverinfo="text",
+            text=[names[j] for j in ys],
         ),
         row=2, col=1,
     )
@@ -333,18 +333,133 @@ def upset_plotly(sets: dict[str, set], max_intersections: int = 40):
     fig.update_xaxes(
         tickmode="array",
         tickvals=list(range(len(rows))),
-        ticktext=[_short(lb, 28) for lb in labels],
-        tickangle=-55,
+        ticktext=[_short(lb, 24) for lb in labels],
+        tickangle=-50,
         row=2, col=1,
     )
     fig.update_yaxes(title_text="n genes", row=1, col=1)
+    # Drop y tick labels on the membership panel — they collide with the dots;
+    # set identity is in the hover text on each marker.
     fig.update_yaxes(
-        tickmode="array", tickvals=list(range(len(names))), ticktext=names, row=2, col=1
+        tickmode="array",
+        tickvals=list(range(len(names))),
+        showticklabels=False,
+        title_text="",
+        row=2,
+        col=1,
     )
     fig.update_layout(
         template="simple_white",
-        height=420 + 28 * len(names),
-        margin=dict(b=120),
-        title="UpSet — exclusive intersections across databases",
+        height=400 + 22 * len(names),
+        margin=dict(l=60, r=20, t=50, b=130),
+        title="UpSet — exclusive intersections (hover dots for set names)",
+    )
+    return fig
+
+
+def venn2_plotly(set_a, set_b, label_a: str = "A", label_b: str = "B"):
+    """Two-set Venn with exclusive / shared counts (plotly shapes; no extra dep)."""
+    import plotly.graph_objects as go
+
+    a, b = set(set_a), set(set_b)
+    only_a, only_b, both = len(a - b), len(b - a), len(a & b)
+    fig = go.Figure()
+    fig.add_shape(
+        type="circle", xref="x", yref="y",
+        x0=0, y0=0, x1=2, y1=2,
+        line_color="#c44e52", fillcolor="rgba(196,78,82,0.25)",
+    )
+    fig.add_shape(
+        type="circle", xref="x", yref="y",
+        x0=1.2, y0=0, x1=3.2, y1=2,
+        line_color="#4c72b0", fillcolor="rgba(76,114,176,0.25)",
+    )
+    fig.add_annotation(x=0.7, y=1.0, text=f"<b>{only_a:,}</b>", showarrow=False, font=dict(size=18))
+    fig.add_annotation(x=2.5, y=1.0, text=f"<b>{only_b:,}</b>", showarrow=False, font=dict(size=18))
+    fig.add_annotation(x=1.6, y=1.0, text=f"<b>{both:,}</b>", showarrow=False, font=dict(size=18))
+    fig.add_annotation(x=0.7, y=2.25, text=_short(label_a, 24), showarrow=False, font=dict(size=13, color="#c44e52"))
+    fig.add_annotation(x=2.5, y=2.25, text=_short(label_b, 24), showarrow=False, font=dict(size=13, color="#4c72b0"))
+    fig.add_annotation(x=0.7, y=0.35, text="only A", showarrow=False, font=dict(size=10, color="#666"))
+    fig.add_annotation(x=2.5, y=0.35, text="only B", showarrow=False, font=dict(size=10, color="#666"))
+    fig.add_annotation(x=1.6, y=0.35, text="shared", showarrow=False, font=dict(size=10, color="#666"))
+    fig.update_xaxes(visible=False, range=[-0.2, 3.4])
+    fig.update_yaxes(visible=False, range=[-0.2, 2.6], scaleanchor="x", scaleratio=1)
+    fig.update_layout(
+        template="simple_white",
+        height=340,
+        margin=dict(l=20, r=20, t=40, b=20),
+        title=f"|A|={len(a):,} · |B|={len(b):,} · shared={both:,}",
+    )
+    return fig
+
+
+def venn3_plotly(set_a, set_b, set_c, label_a="A", label_b="B", label_c="C"):
+    """Three-set Venn with region counts (plotly shapes; schematic, not area-proportional)."""
+    import plotly.graph_objects as go
+
+    a, b, c = set(set_a), set(set_b), set(set_c)
+    only_a = len(a - b - c)
+    only_b = len(b - a - c)
+    only_c = len(c - a - b)
+    ab = len((a & b) - c)
+    ac = len((a & c) - b)
+    bc = len((b & c) - a)
+    abc = len(a & b & c)
+
+    fig = go.Figure()
+    # equilateral-ish triangle of circles
+    circles = [
+        (0.0, 0.55, "#c44e52", label_a),
+        (1.1, 0.55, "#4c72b0", label_b),
+        (0.55, -0.35, "#55a868", label_c),
+    ]
+    r = 1.15
+    for x0, y0, color, _lab in circles:
+        fig.add_shape(
+            type="circle",
+            xref="x",
+            yref="y",
+            x0=x0,
+            y0=y0,
+            x1=x0 + 2 * r,
+            y1=y0 + 2 * r,
+            line_color=color,
+            fillcolor=color.replace(")", ",0.22)").replace("rgb", "rgba")
+            if color.startswith("rgb")
+            else (
+                "rgba(196,78,82,0.22)"
+                if color == "#c44e52"
+                else "rgba(76,114,176,0.22)"
+                if color == "#4c72b0"
+                else "rgba(85,168,104,0.22)"
+            ),
+        )
+    # region count annotations (approximate centers)
+    anns = [
+        (0.55, 2.35, only_a, "#c44e52"),
+        (2.75, 2.35, only_b, "#4c72b0"),
+        (1.65, -0.05, only_c, "#55a868"),
+        (1.65, 2.05, ab, "#333"),
+        (0.95, 1.15, ac, "#333"),
+        (2.35, 1.15, bc, "#333"),
+        (1.65, 1.45, abc, "#111"),
+    ]
+    for x, y, n, col in anns:
+        fig.add_annotation(
+            x=x, y=y, text=f"<b>{n:,}</b>", showarrow=False, font=dict(size=14, color=col)
+        )
+    fig.add_annotation(x=0.4, y=3.0, text=_short(label_a, 18), showarrow=False, font=dict(size=12, color="#c44e52"))
+    fig.add_annotation(x=2.9, y=3.0, text=_short(label_b, 18), showarrow=False, font=dict(size=12, color="#4c72b0"))
+    fig.add_annotation(x=1.65, y=-0.55, text=_short(label_c, 18), showarrow=False, font=dict(size=12, color="#55a868"))
+    fig.update_xaxes(visible=False, range=[-0.3, 3.6])
+    fig.update_yaxes(visible=False, range=[-0.9, 3.3], scaleanchor="x", scaleratio=1)
+    fig.update_layout(
+        template="simple_white",
+        height=420,
+        margin=dict(l=20, r=20, t=40, b=20),
+        title=(
+            f"|A|={len(a):,} · |B|={len(b):,} · |C|={len(c):,} · "
+            f"A∩B∩C={abc:,}"
+        ),
     )
     return fig
