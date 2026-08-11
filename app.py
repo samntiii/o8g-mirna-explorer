@@ -37,6 +37,11 @@ import o8g_sections as sections
 plots = _importlib.reload(plots)   # pick up edits to the plotting module on rerun
 refsets = _importlib.reload(refsets)
 sections = _importlib.reload(sections)
+import o8g_oboe as _o8g_oboe
+import o8g_oboe_model as _o8g_oboe_model
+
+_o8g_oboe_model = _importlib.reload(_o8g_oboe_model)
+_o8g_oboe = _importlib.reload(_o8g_oboe)  # OBOE RNABERT ranking API
 
 st.set_page_config(page_title="o8G-miRNA Retargeting Explorer", layout="wide",
                    initial_sidebar_state="expanded")
@@ -289,26 +294,26 @@ st.sidebar.markdown(f"**Seed (pos 2–8):** `{seed}`")
 st.sidebar.markdown(f"**Guanines in seed:** {len(gpos)} at position(s) {gpos or '—'}")
 st.sidebar.markdown(f"**Oxidation states:** {2**len(gpos)}")
 
-# OBOE-style prior ranking of which seed Gs to oxidize
-with st.sidebar.expander("OBOE-style oxo-G prior", expanded=False):
-    st.caption(
-        "Local GC-rich / G-run prior inspired by OBOE motifs (Xia et al.). "
-        "Ranks seed Gs and ox states — not a live OBOE call (their public API is often offline)."
-    )
+# OBOE oxo-G ranking of which seed Gs to oxidize
+with st.sidebar.expander("OBOE oxo-G prior", expanded=False):
     try:
-        import o8g_oboe as _oboe
-
-        _g_tbl = _oboe.seed_g_table(info["seq_dna"])
+        _ok, _msg = _o8g_oboe.model_status()
+        st.caption(
+            f"{'Local OBOE RNABERT' if _ok else 'Fallback GC prior'} — {_msg}. "
+            "Ranks seed Gs / ox states by P(o8G); not a causal LoF call."
+        )
+        _g_tbl = _o8g_oboe.seed_g_table(info["seq_dna"])
         _seed_only = _g_tbl[_g_tbl["in_seed"]] if len(_g_tbl) else _g_tbl
         if len(_seed_only):
+            _cols = [c for c in ["mature_pos", "window", "oboe_prior", "source"] if c in _seed_only.columns]
             st.dataframe(
-                _seed_only[["mature_pos", "window", "oboe_prior"]],
+                _seed_only[_cols],
                 hide_index=True,
                 height=min(160, 28 * (len(_seed_only) + 1)),
             )
-            _ranked = _oboe.rank_oxidation_states(info["seq_dna"])
+            _ranked = _o8g_oboe.rank_oxidation_states(info["seq_dna"])
             if len(_ranked):
-                st.caption("Top ox states by mean prior")
+                st.caption("Top ox states by mean OBOE prior")
                 st.dataframe(
                     _ranked.head(5)[["ox_label", "mean_oboe_prior", "n_ox"]],
                     hide_index=True,
@@ -756,23 +761,22 @@ elif _SECTION == "All states":
             f"states, library **{lib}** · background = 3′UTR universe (N={len(universe):,})."
         )
         try:
-            import o8g_oboe as _oboe
-
-            with st.expander("OBOE-style ranking of oxidation states", expanded=False):
+            with st.expander("OBOE ranking of oxidation states", expanded=False):
+                _ok, _msg = _o8g_oboe.model_status()
                 st.caption(
-                    "Prioritize which G→o8G combinations to inspect using a local "
-                    "GC-rich motif prior (OBOE-inspired). Live OBOE web inference is optional "
-                    "and often unavailable."
+                    f"Prioritize G→o8G combinations by local OBOE site probability "
+                    f"({'RNABERT' if _ok else 'GC fallback'}: {_msg}). "
+                    "Consequence tables below remain the LoF layer."
                 )
-                _rt = _oboe.rank_oxidation_states(info["seq_dna"])
+                _rt = _o8g_oboe.rank_oxidation_states(info["seq_dna"])
                 st.dataframe(_rt, hide_index=True, height=260, use_container_width=True)
                 if st.checkbox("Probe live OBOE server (best-effort)", value=False, key="oboe_remote"):
                     with st.spinner("Contacting rnamd.org OBOE…"):
-                        rem = _oboe.try_remote_oboe(info["seq_dna"])
+                        rem = _o8g_oboe.try_remote_oboe(info["seq_dna"])
                     if rem is None or rem.get("status") == "error":
                         st.warning(
                             "Live OBOE unavailable (server-side model down). "
-                            "Using the local prior table above."
+                            "Using the local OBOE RNABERT / prior table above."
                         )
                     else:
                         st.json(rem)

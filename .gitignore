@@ -53,3 +53,6 @@ cloudflared-credentials.json
 # OS / editor
 .cursor/
 RNA_*.out
+
+# OBOE fine-tune Trainer checkpoints (keep models/oboe_rnabert/checkpoint)
+models/oboe_rnabert/runs/

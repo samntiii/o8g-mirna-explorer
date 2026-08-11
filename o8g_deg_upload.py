@@ -168,10 +168,11 @@ def render(ctx: SectionContext) -> None:
         )
 
     use_oboe = st.checkbox(
-        "Re-rank by OBOE-style oxo-G prior (local GC-rich motif score)",
+        "Re-rank by OBOE oxo-G prior (local RNABERT / GC fallback)",
         value=False,
         key="deg_oboe",
-        help="Multiplies concordance by mean prior of oxidized positions. Not a live OBOE call.",
+        help="Multiplies concordance by mean P(o8G) of oxidized seed positions "
+        "(fine-tuned OBOE RNABERT when available).",
     )
 
     down_w = st.slider(
@@ -208,7 +209,12 @@ def render(ctx: SectionContext) -> None:
 
     if use_oboe and "ox_label" in ranked.columns:
         try:
+            import importlib
             import o8g_oboe as _oboe
+            import o8g_oboe_model as _oboe_model
+
+            _oboe_model = importlib.reload(_oboe_model)
+            _oboe = importlib.reload(_oboe)
 
             priors = []
             for mir in ranked["mirna"].unique():

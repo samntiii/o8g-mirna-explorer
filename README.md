@@ -71,7 +71,7 @@ only the active section runs on each rerun.
 | **External DB comparison** | Explorer vs TargetScan / miRDB / DIANA / miRmap / ENCORI / miRTarBase (WT catalogs) | local ref files |
 
 Sidebar also has **Select gene** (typeahead → opens Gene → miRNA/oxomiR) and an
-**OBOE-style oxo-G prior** (local GC-rich ranking of seed Gs / states).
+**OBOE oxo-G prior** — local fine-tuned RNABERT (Xia et al. Figshare data; test AUC ~0.98) ranks which seed Gs / ox states are sequence-plausible; GC motif fallback if the checkpoint is missing.
 
 ### Precision modes
 
@@ -117,7 +117,11 @@ and do **not** depend on the U proxy.
 | `o8g_sections.py` | Section context + dispatch |
 | `o8g_venn.py`, `o8g_tf.py`, `o8g_lof.py`, `o8g_anti.py`, `o8g_energy.py` | Views / helpers |
 | `o8g_deg.py`, `o8g_deg_score.py`, `o8g_deg_upload.py` | DEG upload parse + scoring + UI |
-| `o8g_oboe.py` | Local OBOE-style oxo-G prior |
+| `o8g_oboe.py` / `o8g_oboe_model.py` | OBOE RNABERT site prior + ranking |
+| `models/oboe_rnabert/` | Fine-tuned checkpoint (from Figshare CSVs) |
+| `third_party/oboe/` | Vendored Xia et al. Figshare code + data |
+| `scripts/train_oboe_rnabert.py` | Retrain OBOE RNABERT |
+| `requirements-oboe.txt` | Optional torch/transformers stack |
 | `o8g_thermo.py` | ViennaRNA + TargetScan context++ |
 | `o8g_pubthermo.py` | Duplex / RNAup / context++ for Gene → miRNA |
 | `o8g_refsets.py` | External catalog loaders (TargetScan family resolution, etc.) |

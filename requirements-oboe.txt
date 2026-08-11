@@ -1,0 +1,8 @@
+# Optional deps for local OBOE RNABERT ranking (Xia et al.)
+torch>=2.2
+transformers>=4.40
+multimolecule>=0.2
+datasets>=2.18
+accelerate>=0.28
+scikit-learn>=1.3
+safetensors>=0.4
